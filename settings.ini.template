@@ -1,0 +1,58 @@
+[DEFAULT]
+credentials_file = credentials.json
+
+[MAIN_SHEET]
+spreadsheet_id = 15S8Rg2VPVWAoOGUJzsNzajFgRDm8Q5kxVHF31UIQAzQ
+sheet_name = 신아라오티
+
+[SETTINGS]
+k_column_width = 350
+hotkey = F2
+appearance_mode = dark
+popup_topmost = False
+kakao_rate = 500
+setup_rate = 3000
+
+[AS_TEMPLATES]
+list = 프로그램 재설치,수업 입장 안 됨,수업 소리 안 들림,프린터기 설치,베이직북 AS 안내,교과 강의 재생 안 됨
+
+[COPY_BUTTONS]
+btn_1_title =
+btn_1_text =
+btn_2_title =
+btn_2_text =
+btn_3_title =
+btn_3_text =
+btn_4_title =
+btn_4_text =
+btn_5_title =
+btn_5_text =
+btn_6_title =
+btn_6_text =
+btn_7_title =
+btn_7_text =
+btn_8_title =
+btn_8_text =
+btn_9_title =
+btn_9_text =
+btn_10_title =
+btn_10_text =
+btn_11_title =
+btn_11_text =
+btn_12_title =
+btn_12_text =
+btn_13_title =
+btn_13_text =
+btn_14_title =
+btn_14_text =
+btn_15_title =
+btn_15_text =
+
+[KAKAO_STATS]
+
+[COMPANY_SITE]
+url = https://lmsone.com/wcms
+
+[ADMISSION]
+spreadsheet_id = 1ktQojus9PUzY-_3zYTGDxC8SCgmQoff5K1910ZzhNEc
+sheet_name = 입학식 관리

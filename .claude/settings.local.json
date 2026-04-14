@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('araon_core/sheet_manager.py', encoding='utf-8'\\).read\\(\\)\\); print\\('sheet_manager.py: 문법 OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('araon_core/sheet_manager.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Read(//d C:/X/workspace/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('C:/X/workspace/ARAONManagement/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
