@@ -5,6 +5,7 @@ araon_core/config_manager.py
 
 import configparser
 import os
+import shutil
 
 try:
     import keyring
@@ -24,6 +25,14 @@ class ConfigManager:
 
     def _init_config(self):
         if not os.path.exists(self.config_path):
+            # settings.ini.template 이 있으면 자동 복사
+            template = os.path.join(self.base_path, 'settings.ini.template')
+            if os.path.exists(template):
+                shutil.copy2(template, self.config_path)
+                self.config.read(self.config_path, encoding='utf-8')
+                self._ensure_sections()
+                return
+            # 템플릿도 없으면 기본값으로 생성
             self.config['DEFAULT'] = {
                 'CREDENTIALS_FILE': 'credentials.json',
             }
@@ -47,7 +56,6 @@ class ConfigManager:
                 self.config['COPY_BUTTONS'][f'btn_{i}_title'] = f'업무 {i}'
                 self.config['COPY_BUTTONS'][f'btn_{i}_text'] = ''
             self.config['KAKAO_STATS'] = {}
-            # 보안: LMS 계정은 keyring으로만 저장. ini에는 섹션만 남김.
             if not self.config.has_section('COMPANY_SITE'):
                 self.config.add_section('COMPANY_SITE')
             self.save()
@@ -56,7 +64,8 @@ class ConfigManager:
             self._ensure_sections()
 
     def _ensure_sections(self):
-        for section in ['MAIN_SHEET', 'KAKAO_STATS', 'SETTINGS', 'AS_TEMPLATES', 'COPY_BUTTONS', 'COMPANY_SITE']:
+        for section in ['MAIN_SHEET', 'KAKAO_STATS', 'SETTINGS', 'AS_TEMPLATES',
+                        'COPY_BUTTONS', 'COMPANY_SITE', 'LMS', 'UPDATE', 'ADMISSION']:
             if not self.config.has_section(section):
                 self.config.add_section(section)
         # 단가 키 신규 추가 (기존 파일 호환)
@@ -64,6 +73,14 @@ class ConfigManager:
             self.config.set('SETTINGS', 'kakao_rate', '500')
         if not self.config.has_option('SETTINGS', 'setup_rate'):
             self.config.set('SETTINGS', 'setup_rate', '3000')
+        # 자동업데이트 기본값 (기존 파일 호환)
+        _CORRECT_REPO = 'swseokx/araon-management'
+        current_repo = self.config.get('UPDATE', 'repo', fallback='').strip()
+        # 비어있거나 구버전 잘못된 값(ARAONManagement)이면 올바른 값으로 교정
+        if not current_repo or current_repo.lower().replace('-', '') == 'swseokx/araonmanagement':
+            self.config.set('UPDATE', 'repo', _CORRECT_REPO)
+        if not self.config.has_option('UPDATE', 'token'):
+            self.config.set('UPDATE', 'token', '')
         self.save()
 
     def save(self):
