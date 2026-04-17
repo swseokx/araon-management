@@ -2977,6 +2977,16 @@ class AraonWorkstation(ctk.CTk):
                     text='이 학생은 LMS member_id/member_seq 정보가 없습니다.',
                     text_color='#ef4444')
                 return
+
+            # ── 검색 결과에 이미 학년이 있으면 즉시 적용 (LMS fetch 대기 없이) ──
+            quick_grade = target.get('grade', '').strip()
+            if quick_grade:
+                normalized = _normalize_grade(quick_grade)
+                grade_vals = list(self.tt_data.get('subjects_by_grade', {}).keys())
+                if normalized in grade_vals:
+                    grade_var.set(normalized)
+                    update_subject_list()
+
             info_label.configure(text='LMS 현재 시간표를 읽는 중입니다...',
                                  text_color='#9ca3af')
             search_status.configure(text='시간표 불러오는 중...', text_color='#3b82f6')
@@ -3264,7 +3274,7 @@ class AraonWorkstation(ctk.CTk):
             return None
 
     def _tt_search_members(self, driver, keyword: str, log_cb, limit: int = 15) -> list:
-        """memList.asp 검색으로 학생 목록 반환."""
+        """memList.asp 검색으로 학생 목록 반환. 학년 정보도 함께 파싱."""
         from urllib.parse import quote_plus
         keyword = (keyword or '').strip()
         if not keyword:
@@ -3282,16 +3292,47 @@ class AraonWorkstation(ctk.CTk):
 
         results = []
         seen = set()
-        try:
-            html = driver.page_source
-        except Exception:
-            html = ''
 
-        for href, name in re.findall(
-            r'href="([^"]*memWrite\.asp[^"]*member_id=[^"]*member_seq=[^"]*)"[^>]*>([^<]+)</a>',
-            html, re.IGNORECASE,
-        ):
-            name = re.sub(r'\s+', ' ', name).strip()
+        # ── JS 로 테이블 행 전체 파싱 (이름 링크 + 학년 td 포함) ──────────
+        try:
+            raw_rows = driver.execute_script(
+                r"""
+                const rows = [];
+                document.querySelectorAll('table tbody tr, table tr').forEach(function(tr) {
+                    const link = tr.querySelector("a[href*='memWrite.asp']");
+                    if (!link) return;
+                    const href = link.getAttribute('href') || '';
+                    const name = (link.innerText || link.textContent || '').trim();
+                    // 행 안의 모든 td 텍스트에서 학년 패턴 탐색
+                    const tdTexts = Array.from(tr.querySelectorAll('td'))
+                                        .map(function(td) { return (td.innerText || td.textContent || '').trim(); });
+                    let grade = '';
+                    for (var i = 0; i < tdTexts.length; i++) {
+                        var t = tdTexts[i];
+                        // "중1학년", "고2학년", "초4학년" 형태
+                        var m = t.match(/([초중고])(\d)학년/);
+                        if (m) { grade = m[1] + m[2]; break; }
+                        // "중1", "고2", "초4" 단독 셀
+                        var m2 = t.match(/^([초중고])\s*(\d)$/);
+                        if (m2) { grade = m2[1] + m2[2]; break; }
+                        // "M중3" 등 코드+학년 혼합
+                        var m3 = t.match(/[중고초](\d)/);
+                        if (m3 && t.length <= 6) {
+                            var prefix = t.match(/[초중고]/);
+                            if (prefix) { grade = prefix[0] + m3[1]; break; }
+                        }
+                    }
+                    rows.push({href: href, name: name, grade: grade});
+                });
+                return rows;
+                """
+            ) or []
+        except Exception:
+            raw_rows = []
+
+        for item in raw_rows:
+            href = item.get('href', '')
+            name = re.sub(r'\s+', ' ', (item.get('name') or '')).strip()
             mid = re.search(r'member_id=([^&"\']+)', href)
             mseq = re.search(r'member_seq=([^&"\']+)', href)
             if not (name and mid and mseq):
@@ -3304,41 +3345,38 @@ class AraonWorkstation(ctk.CTk):
                 'name': name,
                 'member_id': mid.group(1),
                 'member_seq': mseq.group(1),
+                'grade': item.get('grade', ''),
             })
             if len(results) >= limit:
                 break
 
-        # fallback: DOM 탐색
+        # ── fallback: HTML regex (JS 실패 시) ───────────────────────────
         if not results:
             try:
-                for row in driver.find_elements(
-                    By.CSS_SELECTOR, "table tbody tr, table tr"
-                ):
-                    try:
-                        link = row.find_element(
-                            By.CSS_SELECTOR, "a[href*='memWrite.asp']"
-                        )
-                        href = link.get_attribute('href') or ''
-                        name = re.sub(r'\s+', ' ', (link.text or '').strip())
-                        mid = re.search(r'member_id=([^&]+)', href)
-                        mseq = re.search(r'member_seq=([^&]+)', href)
-                        if not (name and mid and mseq):
-                            continue
-                        k = (mid.group(1), mseq.group(1))
-                        if k in seen:
-                            continue
-                        seen.add(k)
-                        results.append({
-                            'name': name,
-                            'member_id': mid.group(1),
-                            'member_seq': mseq.group(1),
-                        })
-                        if len(results) >= limit:
-                            break
-                    except Exception:
-                        continue
+                html = driver.page_source
             except Exception:
-                pass
+                html = ''
+            for href, name in re.findall(
+                r'href="([^"]*memWrite\.asp[^"]*member_id=[^"]*member_seq=[^"]*)"[^>]*>([^<]+)</a>',
+                html, re.IGNORECASE,
+            ):
+                name = re.sub(r'\s+', ' ', name).strip()
+                mid = re.search(r'member_id=([^&"\']+)', href)
+                mseq = re.search(r'member_seq=([^&"\']+)', href)
+                if not (name and mid and mseq):
+                    continue
+                key = (mid.group(1), mseq.group(1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    'name': name,
+                    'member_id': mid.group(1),
+                    'member_seq': mseq.group(1),
+                    'grade': '',
+                })
+                if len(results) >= limit:
+                    break
         return results
 
     def _tt_fetch_current_timetable(self, driver, member_id: str, member_seq: str, log_cb):
