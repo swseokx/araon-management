@@ -1,4 +1,4 @@
-# --- main.py  ARAON Enterprise Workstation v4.0 ---
+# --- main.py  ARAON Management ---
 # 전면 리팩토링: 보안·안정성·성능 개선판
 
 import sys
@@ -42,6 +42,22 @@ def _get_base_path() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_running_from_temp(base_path: str) -> bool:
+    """
+    exe 가 Temp/AppData/Local/Temp 안에서 실행 중이면 True.
+    Windows 탐색기로 ZIP 을 압축 해제 없이 더블클릭하면 이 경로에서 실행됨.
+    """
+    p = base_path.replace('\\', '/').lower()
+    temp_markers = [
+        '/appdata/local/temp/',
+        '/temp/',
+        '/tmp/',
+        '/rar$',              # WinRAR 임시
+        '/_mei',              # PyInstaller onefile 내부(이론상 안 잡힘)
+    ]
+    return any(mark in p for mark in temp_markers)
+
+
 # ─────────────────────────────────────────────
 #  메인 앱
 # ─────────────────────────────────────────────
@@ -50,6 +66,17 @@ class AraonWorkstation(ctk.CTk):
         super().__init__()
 
         self.base_path = _get_base_path()
+
+        # Temp 폴더에서 실행 경고 (ZIP 압축 해제 없이 실행한 경우)
+        if _is_running_from_temp(self.base_path):
+            messagebox.showwarning(
+                '설치 경로 안내',
+                '⚠ 프로그램이 임시폴더(Temp)에서 실행 중입니다.\n\n'
+                'ZIP 파일을 압축해제한 뒤\n'
+                '압축 푼 폴더 안의 ARAON실행.exe 를 실행해주세요.\n\n'
+                '(탐색기에서 ZIP 을 더블클릭해서 바로 열면\n'
+                ' 이런 오류가 발생합니다.)'
+            )
 
         # 코어 매니저
         self.cfg = ConfigManager(self.base_path)
@@ -76,6 +103,7 @@ class AraonWorkstation(ctk.CTk):
 
         # 매크로 실행 중 플래그 (중복 실행 방지)
         self._bulk_enroll_running = False
+        self._attend_check_running = False
         self._macro_running = False
 
         # LMS 학생 정보 캐시 (일괄 등록 후 프리패치 → 열기 시 즉시 표시)
@@ -83,20 +111,29 @@ class AraonWorkstation(ctk.CTk):
         self.lms_info_cache: dict = {}
         self._load_lms_cache()
 
-        self.title("ARAON Enterprise - Workstation v4.0")
+        # 아이콘 경로 (모든 윈도우/팝업에 적용)
+        self._icon_path = self._resolve_icon_path()
+
+        self.title("ARAON Management")
         self.geometry("1550x950")
+        self._apply_icon(self)
         ctk.set_appearance_mode(
             self.cfg.get('SETTINGS', 'appearance_mode', 'dark')
         )
 
         self.setup_main_ui()
+        self._restore_last_tab()
         self.update_kakao_ui()
         self.update_time_display()
         self._update_flash()
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self.start_hotkey_listener()
         self.start_auto_refresh()
         self.start_time_monitor()
+
+        # 모든 CTkToplevel 팝업에 자동으로 아이콘 적용 (monkey patch)
+        self._patch_toplevel_icon()
 
         self.log.write_system('--- 시스템 가동 ---')
         if not self.cfg.is_keyring_available():
@@ -104,7 +141,23 @@ class AraonWorkstation(ctk.CTk):
                 '⚠ keyring 미설치: 계정이 평문으로 저장됩니다. '
                 '`pip install keyring` 권장'
             )
-        self.load_sheet_data_async()
+
+        # 필수 파일 확인
+        creds_path = os.path.join(
+            self.base_path,
+            self.cfg.get('DEFAULT', 'CREDENTIALS_FILE', 'credentials.json'),
+        )
+        if not os.path.exists(creds_path):
+            self.after(500, lambda: messagebox.showwarning(
+                '필수 파일 누락',
+                f'credentials.json 파일이 없습니다.\n\n'
+                f'구글 API 서비스 계정 키 파일을\n'
+                f'아래 경로에 넣어주세요:\n\n'
+                f'{self.base_path}',
+            ))
+            self.write_system_log(f'⚠ credentials.json 없음: {creds_path}')
+        else:
+            self.load_sheet_data_async()
         # 시작 시 퀵카피 창 자동 오픈 (UI 완전 렌더링 후)
         self.after(1200, self.open_quick_copy_window)
 
@@ -446,17 +499,56 @@ class AraonWorkstation(ctk.CTk):
             return
         self._macro_running = True
         try:
+            self.write_system_log('▶ 카카오 매크로 진입 (단축키 눌림)')
             og_x, og_y = pyautogui.position()
-            win = gw.getActiveWindow()
-            if not win:
+
+            # 활성 창 확인 (None 이면 바탕화면/트레이 등)
+            try:
+                win = gw.getActiveWindow()
+            except Exception as e:
+                self.write_system_log(f'에러: 활성창 조회 실패 — {e}')
                 return
-            self.write_system_log(f'카카오 매크로 가동 (대상: {win.title})')
+            if not win:
+                self.write_system_log(
+                    '안내: 활성창이 없습니다. 카카오톡 상담창을 먼저 클릭해주세요.'
+                )
+                return
+            self.write_system_log(
+                f'카카오 매크로 가동 (대상: "{win.title}" / 크기 {win.width}x{win.height})'
+            )
 
             win_region = (win.left, win.top, win.width, win.height)
             if win.width <= 0 or win.height <= 0:
+                self.write_system_log('안내: 창 크기 비정상 → 전체 화면 스캔으로 전환')
                 win_region = None
 
-            img_dir = self.base_path
+            # 이미지 폴더 탐색: 여러 후보를 순차 확인
+            # - 배포: <root>/img/ (bin/main.exe 기준 ../img)
+            # - 개발: 현재 폴더
+            # - PyInstaller onefile: sys._MEIPASS/img/
+            img_candidates = [
+                os.path.normpath(os.path.join(self.base_path, '..', 'img')),
+                os.path.join(self.base_path, 'img'),
+                self.base_path,
+            ]
+            if hasattr(sys, '_MEIPASS'):
+                img_candidates.insert(0, os.path.join(sys._MEIPASS, 'img'))
+                img_candidates.insert(1, sys._MEIPASS)
+
+            img_dir = None
+            for cand in img_candidates:
+                if os.path.isdir(cand) and os.path.exists(
+                    os.path.join(cand, 'consult_complete_btn.png')
+                ):
+                    img_dir = cand
+                    break
+            if not img_dir:
+                self.write_system_log(
+                    '에러: 이미지 폴더를 찾지 못했습니다. 탐색 경로:\n' +
+                    '\n'.join(f'  - {c}' for c in img_candidates)
+                )
+                return
+            self.write_system_log(f'이미지 폴더: {img_dir}')
 
             send_btn = os.path.join(img_dir, 'send_msg_btn.png')
             loc = self.find_img_any_scale(send_btn, confidence=0.7, region=win_region)
@@ -570,8 +662,35 @@ class AraonWorkstation(ctk.CTk):
                 self._admission_needs_render = True
             self.after(0, self.load_setup_log)
             self.write_system_log(f'데이터 로드 완료 ({len(data)}건)')
+        except FileNotFoundError as e:
+            self.write_system_log(f'시트 로드 실패: {e}')
+            self.after(0, lambda err=str(e): messagebox.showwarning(
+                '파일 누락', err
+            ))
         except Exception as e:
             self.write_system_log(f'시트 로드 실패: {e}\n{traceback.format_exc()}')
+
+    # ──────────────────────────────────────────
+    #  탭 기억 / 복원 / 종료
+    # ──────────────────────────────────────────
+    def _restore_last_tab(self):
+        """settings.ini 에 저장된 마지막 탭으로 전환."""
+        last = self.cfg.get('SETTINGS', 'last_tab', fallback='')
+        if last and last in ('개통/AS', '입학식'):
+            try:
+                self.tab_view.set(last)
+                self._on_tab_switch()
+            except Exception:
+                pass
+
+    def _on_close(self):
+        """앱 종료 시 현재 탭 저장."""
+        try:
+            self.cfg.set('SETTINGS', 'last_tab', self._get_current_tab())
+            self.cfg.save()
+        except Exception:
+            pass
+        self.destroy()
 
     # ──────────────────────────────────────────
     #  탭 전환 콜백 (lazy render)
@@ -644,69 +763,163 @@ class AraonWorkstation(ctk.CTk):
     #  UI 구성
     # ──────────────────────────────────────────
     def setup_main_ui(self):
+        # ── 색상 팔레트 (light, dark) ─────────────────────────────
+        # customtkinter 는 튜플 첫번째 = light, 두번째 = dark
+        C = self._palette = {
+            # 바탕 / 표면
+            'bg':         ('#f1f5f9', '#0f172a'),   # 창 배경
+            'surface':    ('#ffffff', '#1e293b'),   # 카드/탭
+            'surface_hi': ('#f8fafc', '#111827'),   # 스크롤 영역
+            'nav':        ('#ffffff', '#0f172a'),   # 상단 nav 배경
+            'status':     ('#0f172a', '#020617'),   # 상태바
+            'border':     ('#e2e8f0', '#334155'),
+            'text':       ('#0f172a', '#f1f5f9'),
+            'text_dim':   ('#64748b', '#94a3b8'),
+            # 액션 컬러
+            'brand':      ('#2563eb', '#3b82f6'),
+            'brand_hv':   ('#1d4ed8', '#2563eb'),
+            'secondary':  ('#475569', '#475569'),
+            'secondary_hv':('#334155', '#334155'),
+            'success':    ('#059669', '#10b981'),
+            'success_hv': ('#047857', '#059669'),
+            'warning':    ('#d97706', '#f59e0b'),
+            'warning_hv': ('#b45309', '#d97706'),
+            'danger':     ('#dc2626', '#ef4444'),
+            'danger_hv':  ('#b91c1c', '#dc2626'),
+            'violet':     ('#7c3aed', '#8b5cf6'),
+            'violet_hv':  ('#6d28d9', '#7c3aed'),
+            'teal':       ('#0d9488', '#14b8a6'),
+            'teal_hv':    ('#0f766e', '#0d9488'),
+            'orange':     ('#ea580c', '#f97316'),
+            'orange_hv':  ('#c2410c', '#ea580c'),
+            'indigo':     ('#4f46e5', '#6366f1'),
+            'indigo_hv':  ('#4338ca', '#4f46e5'),
+        }
+
+        # 창 배경
+        self.configure(fg_color=C['bg'])
+
         # ── 상단 내비게이션 바 ──
-        nav = ctk.CTkFrame(self, height=70, fg_color='#1a1a1a', corner_radius=0)
+        nav = ctk.CTkFrame(
+            self, height=68, fg_color=C['nav'], corner_radius=0,
+            border_width=0,
+        )
         nav.pack(side='top', fill='x')
 
-        self.date_btn = ctk.CTkButton(
-            nav, text=f'📅 {self.selected_date}',
-            font=('Pretendard', 16, 'bold'), command=self.open_calendar
-        )
-        self.date_btn.pack(side='left', padx=20)
-        ctk.CTkButton(nav, text='⚙ 환경설정', width=100,
-                      fg_color='#444444', command=self.open_settings_menu
-                      ).pack(side='left', padx=5)
-        ctk.CTkButton(nav, text='🔄 새로고침', width=100,
-                      fg_color='#2c3e50', command=self.load_sheet_data_async
-                      ).pack(side='left', padx=5)
-        ctk.CTkButton(nav, text='👨‍🎓 일괄 강의방 등록', width=130,
-                      fg_color='#8e44ad', hover_color='#732d91',
-                      command=self.start_bulk_enroll
-                      ).pack(side='left', padx=15)
-        ctk.CTkButton(nav, text='📅 시간표 작성', width=100,
-                      fg_color='#27ae60', hover_color='#1e8449',
-                      command=self.open_timetable_popup
-                      ).pack(side='left', padx=5)
-        ctk.CTkButton(nav, text='📋 퀵카피 창 열기', width=120,
-                      fg_color='#e67e22', hover_color='#d35400',
-                      command=self.open_quick_copy_window
-                      ).pack(side='left', padx=15)
+        # 얇은 하단 구분선 (border 느낌)
+        nav_border = ctk.CTkFrame(self, height=1, fg_color=C['border'],
+                                   corner_radius=0)
+        nav_border.pack(side='top', fill='x')
 
-        # 모니터 토글 버튼
-        self.monitor_toggle_btn = ctk.CTkButton(
-            nav, text='◀ 모니터', width=90,
-            fg_color='#1f538d', hover_color='#174070',
-            font=('Pretendard', 12, 'bold'),
-            command=self.toggle_monitor_sidebar
+        # 브랜드 로고 (앱 이름)
+        brand_lbl = ctk.CTkLabel(
+            nav, text='ARAON', font=('Pretendard', 18, 'bold'),
+            text_color=C['brand'],
         )
-        self.monitor_toggle_btn.pack(side='right', padx=10)
+        brand_lbl.pack(side='left', padx=(20, 4))
+        ctk.CTkLabel(
+            nav, text='Management', font=('Pretendard', 14),
+            text_color=C['text_dim'],
+        ).pack(side='left', padx=(0, 16))
+
+        # 날짜 버튼
+        self.date_btn = ctk.CTkButton(
+            nav, text=f'📅 {self.selected_date}', height=36,
+            font=('Pretendard', 14, 'bold'),
+            fg_color=C['brand'], hover_color=C['brand_hv'],
+            corner_radius=8,
+            command=self.open_calendar,
+        )
+        self.date_btn.pack(side='left', padx=6)
+
+        # 일반 액션 버튼 공통 스타일
+        btn_kw = dict(height=36, corner_radius=8,
+                      font=('Pretendard', 12, 'bold'))
+
+        ctk.CTkButton(
+            nav, text='⚙ 환경설정', width=100,
+            fg_color=C['secondary'], hover_color=C['secondary_hv'],
+            command=self.open_settings_menu, **btn_kw,
+        ).pack(side='left', padx=4)
+        ctk.CTkButton(
+            nav, text='🔄 새로고침', width=100,
+            fg_color=C['indigo'], hover_color=C['indigo_hv'],
+            command=self.load_sheet_data_async, **btn_kw,
+        ).pack(side='left', padx=4)
+        ctk.CTkButton(
+            nav, text='👨‍🎓 일괄 등록', width=115,
+            fg_color=C['violet'], hover_color=C['violet_hv'],
+            command=self.start_bulk_enroll, **btn_kw,
+        ).pack(side='left', padx=(12, 4))
+        ctk.CTkButton(
+            nav, text='🎯 출석체크 저장', width=130,
+            fg_color=C['teal'], hover_color=C['teal_hv'],
+            command=self.start_attend_check, **btn_kw,
+        ).pack(side='left', padx=4)
+        ctk.CTkButton(
+            nav, text='📅 시간표 작성', width=110,
+            fg_color=C['success'], hover_color=C['success_hv'],
+            command=self.open_timetable_popup, **btn_kw,
+        ).pack(side='left', padx=4)
+        ctk.CTkButton(
+            nav, text='📋 퀵카피', width=90,
+            fg_color=C['orange'], hover_color=C['orange_hv'],
+            command=self.open_quick_copy_window, **btn_kw,
+        ).pack(side='left', padx=(12, 4))
+
+        # ── 우측 영역: 시간 / 라이트모드 스위치 / 모니터 토글 ──
+        self.monitor_toggle_btn = ctk.CTkButton(
+            nav, text='◀ 모니터', width=90, height=36,
+            fg_color=C['brand'], hover_color=C['brand_hv'],
+            font=('Pretendard', 12, 'bold'),
+            corner_radius=8,
+            command=self.toggle_monitor_sidebar,
+        )
+        self.monitor_toggle_btn.pack(side='right', padx=(6, 14))
+
+        # 테마 스위치 (Light ⟷ Dark)
+        current_mode = ctk.get_appearance_mode().lower()
+        self._theme_switch_var = ctk.IntVar(
+            value=1 if current_mode == 'light' else 0
+        )
+        self._theme_switch = ctk.CTkSwitch(
+            nav, text='🌙', font=('Pretendard', 14),
+            variable=self._theme_switch_var, onvalue=1, offvalue=0,
+            command=self._on_theme_switch_toggle,
+            progress_color=C['warning'],
+            width=44, height=24,
+        )
+        self._theme_switch.pack(side='right', padx=6)
 
         self.time_lbl = ctk.CTkLabel(
-            nav, text='', font=('Consolas', 15), text_color='#888888'
+            nav, text='', font=('JetBrains Mono', 13),
+            text_color=C['text_dim'],
         )
-        self.time_lbl.pack(side='right', padx=20)
+        self.time_lbl.pack(side='right', padx=12)
 
         # ── 상태바 (하단) ──
         self.status_bar = ctk.CTkLabel(
-            self, text='  ● 시스템 대기 중', height=30,
-            fg_color='#111111', text_color='#00FF00',
-            anchor='w', cursor='hand2'
+            self, text='  ● 시스템 대기 중', height=28,
+            fg_color=C['status'], text_color='#34d399',
+            anchor='w', cursor='hand2',
+            font=('Pretendard', 11),
         )
         self.status_bar.pack(side='bottom', fill='x')
         self.status_bar.bind('<Button-1>', lambda e: self.open_full_log())
 
         # ── 메인 컨테이너 ──
         container = ctk.CTkFrame(self, fg_color='transparent')
-        container.pack(fill='both', expand=True, padx=15, pady=10)
+        container.pack(fill='both', expand=True, padx=16, pady=12)
 
         # ── 탭 영역 (왼쪽) ──
         self.tab_view = ctk.CTkTabview(
-            container, fg_color='#2b2b2b',
-            segmented_button_fg_color='#1a1a1a',
-            segmented_button_selected_color='#1f538d',
-            segmented_button_selected_hover_color='#174070',
-            segmented_button_unselected_color='#1a1a1a',
-            segmented_button_unselected_hover_color='#2c3e50',
+            container, fg_color=C['surface'],
+            segmented_button_fg_color=C['surface_hi'],
+            segmented_button_selected_color=C['brand'],
+            segmented_button_selected_hover_color=C['brand_hv'],
+            segmented_button_unselected_color=C['surface_hi'],
+            segmented_button_unselected_hover_color=C['border'],
+            corner_radius=12,
         )
         self.tab_view.pack(side='left', fill='both', expand=True, padx=(0, 10))
         self.tab_view.add('개통/AS')
@@ -718,28 +931,35 @@ class AraonWorkstation(ctk.CTk):
         self.header_f = ctk.CTkFrame(tab_open, fg_color='#1f538d', height=40)
         self.header_f.pack(fill='x', padx=5, pady=(5, 0))
         self.render_header()
-        self.sheet_scroll = ctk.CTkScrollableFrame(tab_open, fg_color='#1e1e1e')
+        self.sheet_scroll = ctk.CTkScrollableFrame(
+            tab_open, fg_color=C['surface_hi'], corner_radius=8
+        )
         self.sheet_scroll.pack(fill='both', expand=True, padx=5, pady=5)
 
         # ── 입학식 탭 내부 ──
         tab_adm = self.tab_view.tab('입학식')
-        self.adm_header_f = ctk.CTkFrame(tab_adm, fg_color='#16a085', height=40)
+        self.adm_header_f = ctk.CTkFrame(tab_adm, fg_color=C['teal'], height=40,
+                                           corner_radius=8)
         self.adm_header_f.pack(fill='x', padx=5, pady=(5, 0))
         self.render_admission_header()
-        self.admission_scroll = ctk.CTkScrollableFrame(tab_adm, fg_color='#1e1e1e')
+        self.admission_scroll = ctk.CTkScrollableFrame(
+            tab_adm, fg_color=C['surface_hi'], corner_radius=8
+        )
         self.admission_scroll.pack(fill='both', expand=True, padx=5, pady=5)
 
         # ── 사이드바: Setup Monitor (오른쪽, 토글 가능) ──
-        self.monitor_frame = ctk.CTkFrame(container, width=390, fg_color='#212121')
+        self.monitor_frame = ctk.CTkFrame(
+            container, width=390, fg_color=C['surface'], corner_radius=12
+        )
         self.monitor_frame.pack(side='right', fill='both')
         self.monitor_frame.pack_propagate(False)
 
         # 카카오 상담 카운터 (항상 표시)
         self.kakao_lbl = ctk.CTkLabel(
             self.monitor_frame, text='💬 오늘 카톡 상담: 0건',
-            font=('Pretendard', 14, 'bold'), text_color='#f1c40f'
+            font=('Pretendard', 14, 'bold'), text_color=C['warning']
         )
-        self.kakao_lbl.pack(fill='x', padx=10, pady=(15, 0))
+        self.kakao_lbl.pack(fill='x', padx=12, pady=(16, 0))
 
         # ── 개통/AS 모니터 프레임 ──
         self.open_monitor_f = ctk.CTkFrame(self.monitor_frame, fg_color='transparent')
@@ -748,15 +968,15 @@ class AraonWorkstation(ctk.CTk):
         self.setup_stat_lbl = ctk.CTkLabel(
             self.open_monitor_f,
             text='개통: 0건  /  AS: 0건',
-            font=('Pretendard', 13, 'bold'), text_color='#2ecc71'
+            font=('Pretendard', 13, 'bold'), text_color=C['success']
         )
-        self.setup_stat_lbl.pack(fill='x', padx=10, pady=(6, 0))
+        self.setup_stat_lbl.pack(fill='x', padx=12, pady=(6, 0))
 
         monitor_hdr = ctk.CTkFrame(self.open_monitor_f, fg_color='transparent')
-        monitor_hdr.pack(fill='x', padx=10, pady=(4, 4))
+        monitor_hdr.pack(fill='x', padx=12, pady=(4, 4))
         ctk.CTkLabel(
-            monitor_hdr, text='[ SETUP MONITOR ]',
-            font=('Pretendard', 12, 'bold'), text_color='#3498db'
+            monitor_hdr, text='SETUP MONITOR',
+            font=('Pretendard', 11, 'bold'), text_color=C['text_dim']
         ).pack(side='left')
 
         m_btn_f = ctk.CTkFrame(monitor_hdr, fg_color='transparent')
@@ -767,23 +987,32 @@ class AraonWorkstation(ctk.CTk):
             ('오늘', self.load_today_setup_logs),
         ]:
             ctk.CTkButton(
-                m_btn_f, text=label, width=40, height=22,
-                font=('Pretendard', 10), command=cmd
+                m_btn_f, text=label, width=42, height=22,
+                font=('Pretendard', 10),
+                fg_color=C['secondary'], hover_color=C['secondary_hv'],
+                corner_radius=6,
+                command=cmd
             ).pack(side='left', padx=2)
         ctk.CTkButton(
-            m_btn_f, text='엑셀', width=35, height=22,
-            font=('Pretendard', 10), fg_color='#27ae60', hover_color='#1e8449',
+            m_btn_f, text='엑셀', width=40, height=22,
+            font=('Pretendard', 10),
+            fg_color=C['success'], hover_color=C['success_hv'],
+            corner_radius=6,
             command=self.export_logs_to_excel
         ).pack(side='left', padx=2)
         ctk.CTkButton(
-            m_btn_f, text='📝 편집', width=55, height=22,
-            font=('Pretendard', 10, 'bold'), fg_color='#e67e22',
-            hover_color='#d35400', command=self.open_log_editor_popup
+            m_btn_f, text='📝 편집', width=58, height=22,
+            font=('Pretendard', 10, 'bold'),
+            fg_color=C['orange'], hover_color=C['orange_hv'],
+            corner_radius=6,
+            command=self.open_log_editor_popup
         ).pack(side='left', padx=2)
 
         self.setup_monitor = ctk.CTkTextbox(
-            self.open_monitor_f, fg_color='#000000',
-            text_color='#3498db', font=('Pretendard', 14, 'bold')
+            self.open_monitor_f,
+            fg_color=C['surface_hi'],
+            text_color=C['brand'], font=('Pretendard', 13, 'bold'),
+            corner_radius=8,
         )
         self.setup_monitor.pack(fill='both', expand=True, padx=10, pady=10)
         self.setup_monitor.configure(state='disabled')
@@ -793,20 +1022,23 @@ class AraonWorkstation(ctk.CTk):
         # 초기엔 숨김 (개통/AS 탭이 기본)
 
         adm_mon_hdr = ctk.CTkFrame(self.adm_monitor_f, fg_color='transparent')
-        adm_mon_hdr.pack(fill='x', padx=10, pady=(6, 4))
+        adm_mon_hdr.pack(fill='x', padx=12, pady=(6, 4))
         ctk.CTkLabel(
-            adm_mon_hdr, text='[ 입학식 MONITOR ]',
-            font=('Pretendard', 12, 'bold'), text_color='#16a085'
+            adm_mon_hdr, text='입학식 MONITOR',
+            font=('Pretendard', 11, 'bold'), text_color=C['teal']
         ).pack(side='left')
         ctk.CTkButton(
             adm_mon_hdr, text='지우기', width=50, height=22,
             font=('Pretendard', 10),
+            fg_color=C['secondary'], hover_color=C['secondary_hv'],
+            corner_radius=6,
             command=self._clear_adm_monitor
         ).pack(side='right', padx=2)
 
         self.adm_monitor = ctk.CTkTextbox(
-            self.adm_monitor_f, fg_color='#000000',
-            text_color='#2ecc71', font=('Pretendard', 13)
+            self.adm_monitor_f, fg_color=C['surface_hi'],
+            text_color=C['success'], font=('Pretendard', 12),
+            corner_radius=8,
         )
         self.adm_monitor.pack(fill='both', expand=True, padx=10, pady=(0, 10))
         self.adm_monitor.configure(state='disabled')
@@ -843,7 +1075,10 @@ class AraonWorkstation(ctk.CTk):
             (1, 100), (2, 50), (7, kw),
             (9, 80), (10, 80),
         ]
-        ROW_BG = '#1e1e1e'
+        # Light/Dark 자동 전환되는 행 배경
+        ROW_BG = getattr(self, '_palette', {}).get(
+            'surface', ('#ffffff', '#1e293b')
+        )
 
         def _make_cell(parent, width, value):
             """CTkLabel: Entry보다 훨씬 가볍고 빠름."""
@@ -919,7 +1154,10 @@ class AraonWorkstation(ctk.CTk):
             (1, 100), (2, 50), (7, kw),
             (11, 100), (13, 90), (14, 90), (15, 90),
         ]
-        ROW_BG = '#1e1e1e'
+        # Light/Dark 자동 전환되는 행 배경
+        ROW_BG = getattr(self, '_palette', {}).get(
+            'surface', ('#ffffff', '#1e293b')
+        )
 
         def _make_cell(parent, width, value):
             return ctk.CTkLabel(
@@ -1690,6 +1928,19 @@ class AraonWorkstation(ctk.CTk):
                         'id': '-', 'nm': '-', 'sch': '-', 'grd': '-',
                         'p_nm': '-', 'hp': '-', 'p_hp': '-', 'history': ''
                     }
+        # 입학식 관리 시트 기존 데이터 조회 (체크박스 초기값용, API 1회)
+        try:
+            all_checklists = self.sheet_mgr.get_admission_checklists(
+                self.selected_date
+            )
+        except Exception as e:
+            self.write_system_log(f'기존 체크리스트 일괄 조회 오류: {e}')
+            all_checklists = {}
+
+        for s in students:
+            clean_name = s['name'].replace(' ', '').strip()
+            s['sheet_data'] = all_checklists.get(clean_name)
+
         self.after(0, lambda: self._build_admission_popup_ui(students))
 
     def _lms_write_note(self, driver, text: str) -> bool:
@@ -1764,6 +2015,7 @@ class AraonWorkstation(ctk.CTk):
         student_vars_list = []
 
         CHECKS = [
+            ('notice',     '입학식안내문자'),
             ('kakao',      '카톡등록'),
             ('level',      '레벨테스트'),
             ('note',       '노트'),
@@ -1819,24 +2071,61 @@ class AraonWorkstation(ctk.CTk):
             cb_row = ctk.CTkFrame(card, fg_color='transparent')
             cb_row.pack(fill='x', padx=12, pady=(0, 12))
 
-            sv = {'student': s, 'save_lms': save_lms_v}
+            sheet_data = s.get('sheet_data')  # None 또는 dict
+
+            sv = {'student': s, 'save_lms': save_lms_v, '_sheet_data': sheet_data}
             for key, label in CHECKS:
-                var = ctk.BooleanVar()
+                pre_checked = bool(
+                    sheet_data and sheet_data.get(key, '').upper() == 'O'
+                )
+                var = ctk.BooleanVar(value=pre_checked)
                 sv[key] = var
                 ctk.CTkCheckBox(
                     cb_row, text=label, variable=var, width=105
                 ).pack(side='left', padx=4)
 
-            # 첫 수업 일자 Entry
+            # 첫 수업 일자 — 달력 버튼 (기본값 공백, 클릭 시 달력으로 선택)
+            fc_default = ''
+            if sheet_data and sheet_data.get('first_class', '').strip():
+                fc_default = sheet_data['first_class'].strip()
             ctk.CTkLabel(
                 cb_row, text=' 첫수업:', font=('Pretendard', 12)
             ).pack(side='left', padx=(10, 2))
-            first_class_v = ctk.StringVar(value=today_str)
+            first_class_v = ctk.StringVar(value=fc_default)
             sv['first_class'] = first_class_v
-            ctk.CTkEntry(
+
+            def _open_fc_calendar(var=first_class_v):
+                cal_win = ctk.CTkToplevel(pop)
+                cal_win.title('첫수업일 선택')
+                cal_win.geometry('300x340')
+                cal_win.transient(pop)
+                cal_win.grab_set()
+                cal_win.focus_force()
+                cal = Calendar(cal_win, selectmode='day', locale='ko_KR')
+                cal.pack(pady=15, padx=15)
+
+                def _pick():
+                    d = cal.selection_get()
+                    var.set(f'{d.month}/{d.day}')
+                    cal_win.destroy()
+
+                btn_row = ctk.CTkFrame(cal_win, fg_color='transparent')
+                btn_row.pack(pady=8)
+                ctk.CTkButton(btn_row, text='선택', width=80,
+                              command=_pick).pack(side='left', padx=4)
+                ctk.CTkButton(btn_row, text='지우기', width=80,
+                              fg_color='#7f8c8d',
+                              command=lambda: (var.set(''),
+                                               cal_win.destroy())
+                              ).pack(side='left', padx=4)
+
+            fc_btn = ctk.CTkButton(
                 cb_row, textvariable=first_class_v,
-                width=65, height=28, font=('Pretendard', 12)
-            ).pack(side='left')
+                width=65, height=28, font=('Pretendard', 12),
+                fg_color='#34495e', hover_color='#2c3e50',
+                command=_open_fc_calendar,
+            )
+            fc_btn.pack(side='left')
 
             student_vars_list.append(sv)
 
@@ -1855,14 +2144,49 @@ class AraonWorkstation(ctk.CTk):
                 save_data.append({
                     'student':     sv['student'],
                     'save_lms':    sv['save_lms'].get(),
+                    'notice':      _ox(sv['notice']),
                     'kakao':       _ox(sv['kakao']),
                     'level':       _ox(sv['level']),
                     'note':        _ox(sv['note']),
-                    'first_class': sv['first_class'].get().strip() or today_str,
+                    'first_class': sv['first_class'].get().strip(),
                     'form':        _ox(sv['form']),
                     'tt_send':     _ox(sv['tt_send']),
                     'schedule':    _ox(sv['schedule']),
+                    '_sheet_data': sv.get('_sheet_data'),
                 })
+
+            # 시트와 차이 비교
+            FIELD_LABELS = {
+                'notice': '안내문자', 'kakao': '카톡', 'level': '레벨',
+                'note': '노트', 'first_class': '첫수업', 'form': '폼',
+                'tt_send': '시간표발송', 'schedule': '배정',
+            }
+            conflict_parts = []
+            for sd in save_data:
+                if not sd['save_lms']:
+                    continue
+                sheet_data = sd['_sheet_data']
+                if not sheet_data:
+                    continue
+                name = sd['student']['name']
+                diffs = []
+                for key, label in FIELD_LABELS.items():
+                    sheet_val = sheet_data.get(key, '').strip()
+                    cur_val   = sd[key]
+                    if sheet_val and sheet_val != cur_val:
+                        diffs.append(f'  • {label}: 시트={sheet_val} → 현재={cur_val}')
+                if diffs:
+                    conflict_parts.append(f'[{name}]\n' + '\n'.join(diffs))
+
+            if conflict_parts:
+                msg = (
+                    '시트에 저장된 내용과 다른 점이 있습니다.\n'
+                    '덮어씌우시겠습니까?\n\n'
+                    + '\n\n'.join(conflict_parts)
+                )
+                if not messagebox.askyesno('시트 내용 차이 확인', msg, parent=pop):
+                    return
+
             save_btn.configure(state='disabled', text='처리 중...')
             threading.Thread(
                 target=lambda: _bg_save(save_data), daemon=True
@@ -1889,6 +2213,7 @@ class AraonWorkstation(ctk.CTk):
                 s       = sd['student']
                 name    = s['name']
                 grade   = s['grade']
+                notice  = sd['notice']
                 kakao   = sd['kakao']
                 level   = sd['level']
                 note    = sd['note']
@@ -1898,11 +2223,11 @@ class AraonWorkstation(ctk.CTk):
                 sched   = sd['schedule']
 
                 checklist_str = (
-                    f'카톡{kakao}/레벨{level}/노트{note}/'
+                    f'안내문자{notice}/카톡{kakao}/레벨{level}/노트{note}/'
                     f'첫수업{fc}/폼{form}/시간표{tt_send}/배정{sched}'
                 )
                 lms_text = (
-                    f'입학식 완료 : 카톡등록{kakao}/레벨테스트{level}/노트{note}/'
+                    f'입학식 완료 : 안내문자{notice}/카톡등록{kakao}/레벨테스트{level}/노트{note}/'
                     f'첫 수업 일자 {fc}/폼 등록{form}/'
                     f'전체 시간표 발송{tt_send}/시간표 배정{sched}'
                 )
@@ -1941,7 +2266,7 @@ class AraonWorkstation(ctk.CTk):
                 try:
                     sheet_ok = self.sheet_mgr.update_admission_checklist(
                         self.selected_date, name,
-                        kakao, level, note, fc, form, tt_send, sched
+                        notice, kakao, level, note, fc, form, tt_send, sched
                     )
                     self.write_system_log(
                         f'[{name}] 입학식 시트 '
@@ -1983,6 +2308,8 @@ class AraonWorkstation(ctk.CTk):
             self.after(0, lambda: save_btn.configure(
                 state='normal', text='LMS 저장 및 완료'
             ))
+            # 대시보드 새로고침 (시트 변경 반영)
+            self.after(0, self.load_sheet_data_async)
 
         save_btn = ctk.CTkButton(
             pop, text='LMS 저장 및 완료',
@@ -2189,11 +2516,95 @@ class AraonWorkstation(ctk.CTk):
         # 참고: 카카오 드라이버는 세션 유지를 위해 quit 하지 않음
 
     # ──────────────────────────────────────────
-    #  시간표 작성 팝업
+    #  아이콘 / 테마 헬퍼
+    # ──────────────────────────────────────────
+    def _resolve_icon_path(self) -> str:
+        """favicon.ico 위치 탐색. 개발/배포/Pyinstaller bundle 순."""
+        candidates = [
+            os.path.join(self.base_path, 'favicon.ico'),
+            os.path.join(self.base_path, '..', 'img', 'favicon.ico'),
+            os.path.join(self.base_path, '..', 'favicon.ico'),
+        ]
+        if hasattr(sys, '_MEIPASS'):
+            candidates.insert(0, os.path.join(sys._MEIPASS, 'favicon.ico'))
+        for p in candidates:
+            if os.path.exists(p):
+                return os.path.abspath(p)
+        return ''
+
+    def _apply_icon(self, win):
+        """주어진 Tk/Toplevel 창에 아이콘 적용 (조용히 실패)."""
+        if not self._icon_path:
+            return
+        try:
+            win.iconbitmap(self._icon_path)
+        except Exception:
+            pass
+
+    def _patch_toplevel_icon(self):
+        """ctk.CTkToplevel 생성 시 자동으로 아이콘 적용하도록 monkey patch."""
+        icon_path = self._icon_path
+        if not icon_path:
+            return
+        orig_init = ctk.CTkToplevel.__init__
+
+        def patched(self_, *args, **kwargs):
+            orig_init(self_, *args, **kwargs)
+            try:
+                # tk 가 윈도우를 실제로 만든 뒤 iconbitmap 호출해야 적용됨
+                self_.after(100, lambda: self_.iconbitmap(icon_path))
+            except Exception:
+                pass
+
+        ctk.CTkToplevel.__init__ = patched
+
+    # ──────────────────────────────────────────
+    #  라이트/다크 모드 토글
+    # ──────────────────────────────────────────
+    def _on_theme_switch_toggle(self):
+        """스위치 토글 시: 1=light, 0=dark."""
+        new_mode = 'light' if self._theme_switch_var.get() == 1 else 'dark'
+        ctk.set_appearance_mode(new_mode)
+        self.cfg.set('SETTINGS', 'appearance_mode', new_mode)
+        self.cfg.save()
+
+    def toggle_appearance_mode(self):
+        """라이트/다크 전환 후 설정 저장. (외부에서 호출 시)"""
+        current = ctk.get_appearance_mode().lower()
+        new_mode = 'light' if current == 'dark' else 'dark'
+        ctk.set_appearance_mode(new_mode)
+        self.cfg.set('SETTINGS', 'appearance_mode', new_mode)
+        self.cfg.save()
+        if hasattr(self, '_theme_switch_var'):
+            self._theme_switch_var.set(1 if new_mode == 'light' else 0)
+
+    # ──────────────────────────────────────────
+    #  시간표 배정 팝업 (CoachManagement 방식)
+    #    - LMS 학생 검색으로 대상 선택
+    #    - 현재 배정된 시간표를 불러와 그리드에 미리 표시
+    #    - 수정 후 배정 시 기존 배정을 먼저 삭제 → 재배정
+    #    - 배정 후 자동으로 시간표 조회 창을 띄운다
     # ──────────────────────────────────────────
     def open_timetable_popup(self):
         import json
+        from urllib.parse import quote_plus
+
         tt_path = os.path.join(self.base_path, 'timetable_data.json')
+        # PyInstaller onefile 번들 경로(_MEIPASS)도 fallback 으로 시도
+        if not os.path.exists(tt_path) and hasattr(sys, '_MEIPASS'):
+            meipass_path = os.path.join(sys._MEIPASS, 'timetable_data.json')
+            if os.path.exists(meipass_path):
+                tt_path = meipass_path
+
+        if not os.path.exists(tt_path):
+            messagebox.showerror(
+                '시간표 데이터 없음',
+                f'timetable_data.json 파일을 찾지 못했습니다.\n\n'
+                f'아래 위치에 파일이 있는지 확인해주세요:\n'
+                f'{os.path.join(self.base_path, "timetable_data.json")}\n\n'
+                f'(ZIP 을 압축 해제 없이 실행하면 이 오류가 발생합니다.)'
+            )
+            return
         try:
             with open(tt_path, 'r', encoding='utf-8') as f:
                 self.tt_data = json.load(f)
@@ -2202,204 +2613,552 @@ class AraonWorkstation(ctk.CTk):
             return
 
         pop = ctk.CTkToplevel(self)
-        pop.title('수업 시간표 작성')
-        pop.geometry('1200x900')
+        pop.title('시간표 배정')
+        pop.geometry('1360x960')
+        pop.minsize(1240, 880)
         pop.transient(self)
         pop.focus_force()
 
-        self.selected_subjects: list = []
-        self.final_selection: dict = {}
-        self.grid_cells: dict = {}
-        self.current_matches: dict = {}
-        self.grade_var = ctk.StringVar(value='초4')
-
-        left_panel = ctk.CTkFrame(pop, width=250)
-        left_panel.pack(side='left', fill='y', padx=10, pady=10)
-        right_panel = ctk.CTkFrame(pop)
-        right_panel.pack(side='right', fill='both', expand=True, padx=10, pady=10)
-
-        ctk.CTkLabel(left_panel, text='1. 학생 이름',
-                     font=('Pretendard', 14, 'bold')).pack(pady=(10, 5))
-        self.student_name_entry = ctk.CTkEntry(
-            left_panel, placeholder_text='이름 입력', height=30
-        )
-        self.student_name_entry.pack(fill='x', padx=15, pady=5)
-
-        ctk.CTkLabel(left_panel, text='2. 학년 선택',
-                     font=('Pretendard', 14, 'bold')).pack(pady=(15, 5))
-        grade_menu = ctk.CTkOptionMenu(
-            left_panel,
-            values=list(self.tt_data['subjects_by_grade'].keys()),
-            variable=self.grade_var,
-            command=lambda _: update_subject_list()
-        )
-        grade_menu.pack(pady=5)
-
-        sub_frame = ctk.CTkScrollableFrame(left_panel, width=200, height=400)
-        sub_frame.pack(fill='both', expand=True, padx=5, pady=(10, 0))
-
-        table_f = ctk.CTkFrame(right_panel, fg_color='#1a1a1a')
-        table_f.pack(fill='both', expand=True, padx=10, pady=10)
+        # ── 팝업 전용 상태 ────────────────────────────────────
+        tt_state = {
+            'driver': None,                # LMS 드라이버 (lazy)
+            'target': None,                # {'name','member_id','member_seq','grade'}
+            'existing_entries': [],        # 현재 LMS 에 배정된 엔트리
+            'managed_subjects': [],        # 현재 학년 기준 관리 가능 과목
+            'search_results': [],          # 검색 결과 목록
+        }
+        selected_subjects: list = []
+        final_selection: dict = {}
+        current_matches: dict = {}
+        grid_cells: dict = {}
+        grade_var = ctk.StringVar(value='중1')
+        chk_weekly_var = ctk.BooleanVar(value=False)
+        chk_writing_var = ctk.BooleanVar(value=False)
 
         days = ['월', '화', '수', '목', '금']
-        base_times = set(
+        base_times = sorted({
             t
-            for g in self.tt_data['subjects_by_grade'].values()
+            for g in self.tt_data.get('subjects_by_grade', {}).values()
             for s in g.values()
             for d in s.values()
             for t in d
-        )
-        all_times = sorted(list(base_times | {'21:40', '22:30', '23:20'}))
+        } | {'21:40', '22:30', '23:20'})
 
+        # ── 레이아웃 ──────────────────────────────────────────
+        outer = ctk.CTkFrame(pop, fg_color='transparent')
+        outer.pack(fill='both', expand=True, padx=10, pady=10)
+
+        left_panel = ctk.CTkFrame(outer, width=400)
+        left_panel.pack(side='left', fill='y', padx=(0, 10))
+        left_panel.pack_propagate(False)
+
+        right_panel = ctk.CTkFrame(outer)
+        right_panel.pack(side='right', fill='both', expand=True)
+
+        # 왼쪽 하단(버튼) / 위쪽(스크롤 콘텐츠) 분리
+        footer_panel = ctk.CTkFrame(left_panel, fg_color='transparent')
+        footer_panel.pack(side='bottom', fill='x', padx=10, pady=(5, 10))
+        content_panel = ctk.CTkScrollableFrame(left_panel, fg_color='transparent')
+        content_panel.pack(fill='both', expand=True, padx=10, pady=(10, 0))
+
+        ctk.CTkLabel(content_panel, text='시간표 배정 도우미',
+                     font=('Pretendard', 17, 'bold')).pack(anchor='w', pady=(0, 2))
+        ctk.CTkLabel(content_panel, text='학생 검색 → LMS 현재 시간표 로드 → 수정 → 배정',
+                     font=('Pretendard', 11), text_color='#888888').pack(anchor='w', pady=(0, 10))
+
+        # 1. 학생 검색
+        ctk.CTkLabel(content_panel, text='1. LMS 학생 검색',
+                     font=('Pretendard', 14, 'bold')).pack(anchor='w', pady=(0, 4))
+        search_row = ctk.CTkFrame(content_panel, fg_color='transparent')
+        search_row.pack(fill='x', pady=(0, 4))
+        e_search = ctk.CTkEntry(search_row, placeholder_text='학생 이름 검색', height=32)
+        e_search.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        btn_search = ctk.CTkButton(search_row, text='LMS 검색', width=90, height=32,
+                                   fg_color='#1f538d', hover_color='#1a4573')
+        btn_search.pack(side='right')
+
+        search_status = ctk.CTkLabel(content_panel, text='',
+                                     font=('Pretendard', 11), text_color='#888888')
+        search_status.pack(anchor='w', pady=(0, 4))
+
+        result_scroll = ctk.CTkScrollableFrame(content_panel, width=360, height=140)
+        result_scroll.pack(fill='x', pady=(0, 10))
+
+        selected_label = ctk.CTkLabel(content_panel, text='선택된 학생: 없음',
+                                      font=('Pretendard', 12, 'bold'),
+                                      text_color='#3b82f6')
+        selected_label.pack(anchor='w', pady=(0, 10))
+
+        # 2. 학년 선택
+        ctk.CTkLabel(content_panel, text='2. 학년 선택',
+                     font=('Pretendard', 14, 'bold')).pack(anchor='w', pady=(4, 4))
+        grade_menu = ctk.CTkOptionMenu(
+            content_panel,
+            values=list(self.tt_data.get('subjects_by_grade', {}).keys()) or ['중1'],
+            variable=grade_var,
+            width=180,
+        )
+        grade_menu.pack(anchor='w', pady=(0, 10))
+
+        # 3. 과목 선택
+        ctk.CTkLabel(content_panel, text='3. 과목 선택',
+                     font=('Pretendard', 14, 'bold')).pack(anchor='w', pady=(4, 4))
+        sub_frame = ctk.CTkScrollableFrame(content_panel, width=360, height=240)
+        sub_frame.pack(fill='x', pady=(0, 10))
+
+        # 오른쪽: 안내 + 그리드 + 로그
+        info_box = ctk.CTkFrame(right_panel, fg_color='#111827', corner_radius=8)
+        info_box.pack(fill='x', padx=10, pady=(10, 6))
+        ctk.CTkLabel(info_box, text='4. 오른쪽 시간표에서 최종 배정 칸을 클릭',
+                     font=('Pretendard', 14, 'bold')).pack(anchor='w', padx=12, pady=(10, 2))
+        info_label = ctk.CTkLabel(info_box,
+                                  text='학생을 선택하면 LMS 현재 시간표를 먼저 불러옵니다.',
+                                  font=('Pretendard', 11),
+                                  text_color='#9ca3af')
+        info_label.pack(anchor='w', padx=12, pady=(0, 10))
+
+        table_wrap = ctk.CTkScrollableFrame(right_panel, fg_color='#1a1a1a')
+        table_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+
+        log_box = ctk.CTkTextbox(right_panel, height=140, fg_color='#0f172a',
+                                 text_color='#e2e8f0')
+        log_box.pack(fill='x', padx=10, pady=(0, 10))
+
+        def write_log(msg: str):
+            try:
+                log_box.insert('end', msg + '\n')
+                log_box.see('end')
+            except Exception:
+                pass
+            self.write_system_log(msg)
+
+        # ── 그리드 ────────────────────────────────────────────
         def init_grid():
             for j, day in enumerate(['시간'] + days):
                 ctk.CTkLabel(
-                    table_f, text=day,
+                    table_wrap, text=day,
                     font=('Pretendard', 13, 'bold'),
                     width=140, fg_color='#333333'
-                ).grid(row=0, column=j, padx=1, pady=1)
-            for i, ts in enumerate(all_times):
+                ).grid(row=0, column=j, padx=1, pady=1, sticky='nsew')
+            for i, ts in enumerate(base_times):
                 ctk.CTkLabel(
-                    table_f, text=ts, width=80, fg_color='#2b2b2b'
+                    table_wrap, text=ts, width=80, fg_color='#2b2b2b'
                 ).grid(row=i + 1, column=0, padx=1, pady=1)
                 for j, day in enumerate(days):
                     btn = ctk.CTkButton(
-                        table_f, text='', width=140, height=45,
+                        table_wrap, text='', width=140, height=44,
                         fg_color='#111111', font=('Pretendard', 11),
                         state='disabled'
                     )
                     btn.grid(row=i + 1, column=j + 1, padx=1, pady=1)
-                    btn.configure(command=(lambda d=day, t=ts: lambda: click_cell(d, t))())
-                    self.grid_cells[(day, ts)] = btn
-
-        def update_subject_list():
-            for w in sub_frame.winfo_children():
-                w.destroy()
-            self.selected_subjects = []
-            self.final_selection = {}
-            grade = self.grade_var.get()
-            all_subs = (
-                list(self.tt_data['subjects_by_grade'][grade].keys()) +
-                list(self.tt_data['english_timetable'].keys())
-            )
-            for sub in all_subs:
-                ctk.CTkCheckBox(
-                    sub_frame, text=sub,
-                    command=lambda s=sub: toggle_subject(s)
-                ).pack(anchor='w', pady=2, padx=5)
-            update_timetable_view()
-
-        def toggle_subject(sub):
-            if sub in self.selected_subjects:
-                self.selected_subjects.remove(sub)
-            else:
-                self.selected_subjects.append(sub)
-            for k in [k for k, v in self.final_selection.items() if v == sub]:
-                del self.final_selection[k]
-            update_timetable_view()
+                    btn.configure(command=lambda d=day, t=ts: click_cell(d, t))
+                    grid_cells[(day, ts)] = btn
 
         def update_timetable_view():
-            grade = self.grade_var.get()
-            subject_counts = {}
-            for s in self.final_selection.values():
+            current_matches.clear()
+            grade = grade_var.get()
+            subject_counts: dict = {}
+            for s in final_selection.values():
                 subject_counts[s] = subject_counts.get(s, 0) + 1
 
-            sel_sub_data = {}
-            for sub in self.selected_subjects:
+            sel_sub_data: dict = {}
+            for sub in selected_subjects:
                 sel_sub_data[sub] = (
-                    self.tt_data['english_timetable'].get(sub) or
-                    self.tt_data['subjects_by_grade'][grade].get(sub, {})
+                    self.tt_data.get('english_timetable', {}).get(sub)
+                    or self.tt_data.get('subjects_by_grade', {}).get(grade, {}).get(sub, {})
                 )
 
-            self.current_matches.clear()
             for day in days:
-                for ts in all_times:
-                    matches = []
+                for ts in base_times:
                     key = (day, ts)
-                    for sub in self.selected_subjects:
+                    matches = []
+                    for sub in selected_subjects:
                         if (subject_counts.get(sub, 0) >= 2 and
-                                self.final_selection.get(key) != sub):
+                                final_selection.get(key) != sub):
                             continue
-                        for dk, tl in sel_sub_data[sub].items():
+                        for dk, tl in sel_sub_data.get(sub, {}).items():
                             if day in dk and ts in tl:
                                 matches.append(sub)
-                    self.current_matches[key] = matches
-                    btn = self.grid_cells[key]
-                    if matches:
-                        is_sel = key in self.final_selection
-                        color = '#e67e22' if is_sel else '#1f538d'
-                        text = (
-                            self.final_selection[key] if is_sel
-                            else '\n'.join(matches)
+                    current_matches[key] = matches
+                    btn = grid_cells[key]
+                    if key in final_selection:
+                        btn.configure(
+                            text=final_selection[key], state='normal',
+                            fg_color='#e67e22', hover_color='#d35400',
                         )
-                        btn.configure(text=text, fg_color=color, state='normal')
+                    elif matches:
+                        btn.configure(
+                            text='\n'.join(matches), state='normal',
+                            fg_color='#1f538d', hover_color='#1a4573',
+                        )
                     else:
-                        btn.configure(text='', fg_color='#111111', state='disabled')
+                        btn.configure(
+                            text='', state='disabled',
+                            fg_color='#111111', hover_color='#111111',
+                        )
 
-        def click_cell(day, ts):
+        def click_cell(day: str, ts: str):
             key = (day, ts)
-            matches = self.current_matches.get(key, [])
+            if key in final_selection:
+                del final_selection[key]
+                update_timetable_view()
+                return
+            matches = current_matches.get(key, [])
             if not matches:
                 return
-            if key in self.final_selection:
-                del self.final_selection[key]
+            if len(matches) == 1:
+                final_selection[key] = matches[0]
                 update_timetable_view()
                 return
-            if len(matches) > 1:
-                menu = ctk.CTkToplevel(pop)
-                menu.title('과목 선택')
-                menu.geometry('200x250')
-                menu.transient(pop)
-                menu.focus_force()
-                ctk.CTkLabel(menu, text='등록할 과목 선택',
-                             font=('Pretendard', 12, 'bold')).pack(pady=10)
-                for m in matches:
-                    ctk.CTkButton(
-                        menu, text=m,
-                        command=lambda val=m: [
-                            self.final_selection.update({key: val}),
-                            menu.destroy(),
-                            update_timetable_view()
-                        ]
-                    ).pack(pady=2, padx=10, fill='x')
-            else:
-                self.final_selection[key] = matches[0]
-                update_timetable_view()
+            # 여러 후보 → 선택 팝업
+            menu = ctk.CTkToplevel(pop)
+            menu.title('과목 선택')
+            menu.geometry('220x260')
+            menu.transient(pop)
+            menu.focus_force()
+            ctk.CTkLabel(menu, text='배정할 과목 선택',
+                         font=('Pretendard', 13, 'bold')).pack(pady=10)
+            for m in matches:
+                ctk.CTkButton(
+                    menu, text=m,
+                    command=lambda val=m: [
+                        final_selection.update({key: val}),
+                        menu.destroy(),
+                        update_timetable_view()
+                    ]
+                ).pack(pady=3, padx=12, fill='x')
 
-        def send_to_clipboard():
-            if not self.final_selection:
+        # ── 과목 체크리스트 ───────────────────────────────────
+        def get_available_subjects_for_grade(grade: str) -> list:
+            return (
+                list(self.tt_data.get('subjects_by_grade', {}).get(grade, {}).keys())
+                + list(self.tt_data.get('english_timetable', {}).keys())
+            )
+
+        def _norm_key(s: str) -> str:
+            return re.sub(r'\s+', '', (s or '').strip()).lower()
+
+        def is_managed_subject(subject: str, managed: list) -> bool:
+            sk = _norm_key(subject)
+            if not sk:
+                return False
+            for cand in managed or []:
+                ck = _norm_key(cand)
+                if ck and ck in sk:
+                    return True
+            return False
+
+        def toggle_subject(var, sub):
+            if var.get():
+                if sub not in selected_subjects:
+                    selected_subjects.append(sub)
+            elif sub in selected_subjects:
+                selected_subjects.remove(sub)
+            for k in [k for k, v in list(final_selection.items()) if v == sub]:
+                del final_selection[k]
+            update_timetable_view()
+
+        def update_subject_list(preselected=None, keep_selection=None):
+            for w in sub_frame.winfo_children():
+                w.destroy()
+            selected_subjects.clear()
+            if keep_selection is None:
+                final_selection.clear()
+            else:
+                final_selection.clear()
+                final_selection.update(keep_selection)
+            grade = grade_var.get()
+            subjects = get_available_subjects_for_grade(grade)
+            tt_state['managed_subjects'] = list(subjects)
+            for sub in preselected or []:
+                if sub in subjects and sub not in selected_subjects:
+                    selected_subjects.append(sub)
+            for sub in subjects:
+                var = ctk.BooleanVar(value=sub in selected_subjects)
+                ctk.CTkCheckBox(
+                    sub_frame, text=sub, variable=var,
+                    command=lambda v=var, s=sub: toggle_subject(v, s)
+                ).pack(anchor='w', pady=2, padx=4)
+            update_timetable_view()
+
+        grade_menu.configure(
+            command=lambda _: update_subject_list(
+                preselected=list(selected_subjects),
+                keep_selection=dict(final_selection),
+            )
+        )
+
+        # ── 검색 결과 렌더 ────────────────────────────────────
+        def set_selected_target(target: dict):
+            tt_state['target'] = target
+            selected_label.configure(
+                text=f"선택된 학생: {target.get('name', '')} "
+                     f"({target.get('member_id', '')}/{target.get('member_seq', '')})"
+            )
+
+        def render_results():
+            for w in result_scroll.winfo_children():
+                w.destroy()
+            for item in tt_state['search_results']:
+                caption = item['name']
+                if item.get('grade'):
+                    caption += f"  |  {item['grade']}"
+                ctk.CTkButton(
+                    result_scroll, text=caption,
+                    height=32, anchor='w',
+                    fg_color='#374151', hover_color='#4b5563',
+                    command=lambda v=item: load_target(v),
+                ).pack(fill='x', pady=2)
+
+        def do_search():
+            keyword = e_search.get().strip()
+            if not keyword:
+                search_status.configure(text='학생 이름을 입력해주세요.',
+                                        text_color='#ef4444')
                 return
-            summary = {}
-            for (day, ts), sub in self.final_selection.items():
+            search_status.configure(text='LMS 검색 중...', text_color='#3b82f6')
+            btn_search.configure(state='disabled')
+
+            def _work():
+                try:
+                    driver = self._tt_ensure_driver(tt_state, write_log)
+                    if not driver:
+                        pop.after(0, lambda: (
+                            search_status.configure(text='LMS 로그인 실패',
+                                                    text_color='#ef4444'),
+                            btn_search.configure(state='normal'),
+                        ))
+                        return
+                    results = self._tt_search_members(driver, keyword, write_log)
+                except Exception as e:
+                    pop.after(0, lambda err=e: (
+                        search_status.configure(text=f'검색 오류: {err}',
+                                                text_color='#ef4444'),
+                        btn_search.configure(state='normal'),
+                    ))
+                    return
+
+                def _done():
+                    tt_state['search_results'] = results
+                    render_results()
+                    if results:
+                        search_status.configure(
+                            text=f'{len(results)}명 검색됨. 학생을 누르면 시간표를 불러옵니다.',
+                            text_color='#9ca3af')
+                    else:
+                        search_status.configure(text='검색 결과 없음',
+                                                text_color='#ef4444')
+                    btn_search.configure(state='normal')
+                    if len(results) == 1:
+                        load_target(results[0])
+                pop.after(0, _done)
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        btn_search.configure(command=do_search)
+        e_search.bind('<Return>', lambda _e: do_search())
+
+        # ── 학생 선택 → 현재 시간표 로드 ───────────────────────
+        def _normalize_grade(raw: str) -> str:
+            val = (raw or '').replace(' ', '')
+            if '초' in val:
+                m = re.search(r'(\d)', val)
+                return f'초{m.group(1)}' if m else '초4'
+            if '고' in val:
+                m = re.search(r'(\d)', val)
+                return f'고{m.group(1)}' if m else '고1'
+            m = re.search(r'(\d)', val)
+            return f'중{m.group(1)}' if m else '중1'
+
+        def load_target(target: dict):
+            set_selected_target(target)
+            if not target.get('member_id') or not target.get('member_seq'):
+                search_status.configure(
+                    text='이 학생은 LMS member_id/member_seq 정보가 없습니다.',
+                    text_color='#ef4444')
+                return
+            info_label.configure(text='LMS 현재 시간표를 읽는 중입니다...',
+                                 text_color='#9ca3af')
+            search_status.configure(text='시간표 불러오는 중...', text_color='#3b82f6')
+
+            def _work():
+                try:
+                    driver = self._tt_ensure_driver(tt_state, write_log)
+                    if not driver:
+                        pop.after(0, lambda: info_label.configure(
+                            text='LMS 드라이버 생성 실패', text_color='#ef4444'))
+                        return
+                    ok, payload = self._tt_fetch_current_timetable(
+                        driver, target['member_id'], target['member_seq'], write_log
+                    )
+                except Exception as e:
+                    pop.after(0, lambda err=e: info_label.configure(
+                        text=f'시간표 불러오기 오류: {err}', text_color='#ef4444'))
+                    return
+
+                def _done():
+                    if not ok:
+                        info_label.configure(text=f'시간표 불러오기 실패: {payload}',
+                                             text_color='#ef4444')
+                        search_status.configure(text=str(payload),
+                                                text_color='#ef4444')
+                        return
+
+                    tt_state['existing_entries'] = []
+                    grade_text = payload.get('grade', '') or target.get('grade', '')
+                    if grade_text:
+                        grade_var.set(_normalize_grade(grade_text))
+                    managed = get_available_subjects_for_grade(grade_var.get())
+                    tt_state['managed_subjects'] = managed
+                    chk_weekly_var.set(bool(payload.get('weekly')))
+                    chk_writing_var.set(bool(payload.get('writing')))
+
+                    keep_selection = {}
+                    managed_entries = []
+                    for e_ in payload.get('entries', []):
+                        if is_managed_subject(e_.get('subject', ''), managed):
+                            managed_entries.append(e_)
+                        if (is_managed_subject(e_.get('subject', ''), managed)
+                                and e_.get('day') in days
+                                and e_.get('time') in base_times
+                                and e_.get('subject')):
+                            keep_selection[(e_['day'], e_['time'])] = e_['subject']
+                    tt_state['existing_entries'] = managed_entries
+
+                    preselected = [
+                        s for s in payload.get('subjects', [])
+                        if is_managed_subject(s, managed)
+                    ]
+                    update_subject_list(preselected=preselected,
+                                        keep_selection=keep_selection)
+                    search_status.configure(
+                        text=f"{payload.get('name', target.get('name', ''))} 시간표 "
+                             f"{len(payload.get('entries', []))}건 로드됨",
+                        text_color='#10b981')
+                    info_label.configure(
+                        text='주황색은 저장될 칸입니다. 과목 체크를 바꾸거나 칸을 눌러 수정하세요.',
+                        text_color='#9ca3af')
+                pop.after(0, _done)
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        # ── 배정/보기/복사 ────────────────────────────────────
+        def do_assign():
+            target = tt_state.get('target')
+            if not target:
+                write_log('먼저 학생을 검색·선택해주세요.')
+                return
+            if not final_selection:
+                write_log('배정할 시간표 칸이 없습니다.')
+                return
+            btn_assign.configure(state='disabled')
+            write_log(f"[{target['name']}] 시간표 배정 시작")
+
+            existing = list(tt_state.get('existing_entries') or [])
+            managed = list(tt_state.get('managed_subjects') or [])
+            selection = dict(final_selection)
+            is_weekly = chk_weekly_var.get()
+            is_writing = chk_writing_var.get()
+
+            def _work():
+                try:
+                    driver = self._tt_ensure_driver(tt_state, write_log)
+                    if not driver:
+                        pop.after(0, lambda: btn_assign.configure(state='normal'))
+                        return
+                    ok = self._tt_run_assign(
+                        driver=driver,
+                        member_id=target['member_id'],
+                        member_seq=target['member_seq'],
+                        final_selection=selection,
+                        assign_weekly=is_weekly,
+                        assign_writing=is_writing,
+                        existing_entries=existing,
+                        managed_subjects=managed,
+                        log_cb=write_log,
+                    )
+                except Exception as e:
+                    pop.after(0, lambda err=e: (
+                        write_log(f'배정 오류: {err}'),
+                        btn_assign.configure(state='normal'),
+                    ))
+                    return
+
+                def _done():
+                    btn_assign.configure(state='normal')
+                    if ok:
+                        # 배정 성공한 final_selection 을 existing 으로 갱신
+                        tt_state['existing_entries'] = [
+                            {'subject': sub, 'day': d, 'time': t}
+                            for (d, t), sub in selection.items()
+                        ]
+                        write_log('배정 완료 → 시간표 조회 창을 엽니다.')
+                        # 완료 후 시간표 보기 창 자동 실행
+                        threading.Thread(
+                            target=self._tt_view_timetable,
+                            args=(driver, target['member_id'], target['member_seq'],
+                                  target['name'], write_log),
+                            daemon=True
+                        ).start()
+                    else:
+                        write_log('배정 실패 또는 일부 실패')
+                pop.after(0, _done)
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        def do_view():
+            target = tt_state.get('target')
+            if not target:
+                write_log('먼저 학생을 검색·선택해주세요.')
+                return
+
+            def _work():
+                try:
+                    driver = self._tt_ensure_driver(tt_state, write_log)
+                    if not driver:
+                        return
+                    self._tt_view_timetable(
+                        driver, target['member_id'], target['member_seq'],
+                        target['name'], write_log
+                    )
+                except Exception as e:
+                    pop.after(0, lambda err=e: write_log(f'시간표 보기 오류: {err}'))
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        def copy_subject_timetable():
+            if not final_selection:
+                write_log('복사할 배정 칸이 없습니다.')
+                return
+            summary: dict = {}
+            for (day, ts), sub in final_selection.items():
                 summary.setdefault(sub, []).append((day, ts))
-            result = f"[과목별 시간표 - {self.grade_var.get()}]\n"
+            target = tt_state.get('target') or {}
+            result = f"[과목별 시간표 - {target.get('name', '') or grade_var.get()}]\n"
             for sub, slots in summary.items():
-                tg = {}
+                tg: dict = {}
                 for d, t in slots:
                     tg.setdefault(t, []).append(d)
                 for t, dl in tg.items():
                     result += f'• {sub} {t} {", ".join(dl)}\n'
             pyperclip.copy(result)
-            self.write_system_log(f'과목별 시간표 복사 ({len(self.final_selection)}개)')
-            self.copy_btn.configure(text='✅ 복사 완료')
-            self.after(2000, lambda: self.copy_btn.configure(text='📋 과목별 시간표 복사'))
+            write_log(f'과목별 시간표 복사 ({len(final_selection)}개)')
 
-        def send_full_timetable():
-            if not self.selected_subjects:
-                messagebox.showwarning('선택 없음', '과목을 체크해주세요.', parent=pop)
+        def copy_full_timetable():
+            if not selected_subjects:
+                write_log('과목을 먼저 체크해주세요.')
                 return
-            name = self.student_name_entry.get().strip()
-            grade = self.grade_var.get()
-            days_order = ['월', '화', '수', '목', '금']
-            result = f"[전체 시간표 - {name or '학생'}]\n\n"
-            for sub in self.selected_subjects:
+            target = tt_state.get('target') or {}
+            grade = grade_var.get()
+            result = f"[전체 시간표 - {target.get('name', '') or '학생'}]\n\n"
+            for sub in selected_subjects:
                 result += f'[{sub}]\n'
                 sub_data = (
-                    self.tt_data['english_timetable'].get(sub) or
-                    self.tt_data['subjects_by_grade'].get(grade, {}).get(sub, {})
+                    self.tt_data.get('english_timetable', {}).get(sub)
+                    or self.tt_data.get('subjects_by_grade', {}).get(grade, {}).get(sub, {})
                 )
                 slots = []
-                for day in days_order:
+                for day in days:
                     for dk, tl in sub_data.items():
                         if day in dk:
                             for t in tl:
@@ -2407,123 +3166,438 @@ class AraonWorkstation(ctk.CTk):
                 if not slots:
                     result += ' - 배정 가능한 시간이 없습니다.\n\n'
                     continue
-                t2d = {}
+                t2d: dict = {}
                 for d, t in slots:
                     if d not in t2d.setdefault(t, []):
                         t2d[t].append(d)
                 for t in sorted(t2d):
-                    dl = sorted(t2d[t], key=lambda x: days_order.index(x))
+                    dl = sorted(t2d[t], key=lambda x: days.index(x))
                     result += f' - {t} ({", ".join(dl)})\n'
                 result += '\n'
             pyperclip.copy(result.strip())
-            self.write_system_log(f'전체 시간표 복사 ({len(self.selected_subjects)}과목)')
-            self.full_copy_btn.configure(text='✅ 전체 복사 완료')
-            self.after(2000, lambda: self.full_copy_btn.configure(text='📝 전체 시간표 복사'))
+            write_log(f'전체 시간표 복사 ({len(selected_subjects)}과목)')
 
-        def assign_timetable():
-            name = self.student_name_entry.get().strip()
-            if not name:
-                messagebox.showwarning('입력 오류', '학생 이름을 입력해주세요.', parent=pop)
-                return
-            is_weekly = self.chk_weekly_var.get()
-            is_writing = self.chk_writing_var.get()
-            self.write_system_log(f'[{name}] 시간표 배정 매크로 실행...')
-            threading.Thread(
-                target=self._run_timetable_assignment,
-                args=(name, is_weekly, is_writing), daemon=True
-            ).start()
+        # ── 하단 버튼/옵션 ─────────────────────────────────────
+        opt_row = ctk.CTkFrame(footer_panel, fg_color='transparent')
+        opt_row.pack(fill='x', pady=(0, 6))
+        ctk.CTkCheckBox(opt_row, text='주간', variable=chk_weekly_var, width=70
+                        ).pack(side='left', padx=(4, 10))
+        ctk.CTkCheckBox(opt_row, text='필기', variable=chk_writing_var, width=70
+                        ).pack(side='left')
 
-        def view_timetable():
-            name = self.student_name_entry.get().strip()
-            if not name:
-                messagebox.showwarning('입력 오류', '학생 이름을 입력해주세요.', parent=pop)
-                return
-            threading.Thread(
-                target=self._run_view_timetable, args=(name,), daemon=True
-            ).start()
-
-        # 버튼 배치
-        self.full_copy_btn = ctk.CTkButton(
-            left_panel, text='📝 전체 시간표 복사',
-            fg_color='#2980b9', hover_color='#1f618d',
-            command=send_full_timetable
+        btn_row1 = ctk.CTkFrame(footer_panel, fg_color='transparent')
+        btn_row1.pack(fill='x', pady=2)
+        ctk.CTkButton(btn_row1, text='🔄 선택 초기화', height=34,
+                      fg_color='#6b7280', hover_color='#4b5563',
+                      command=lambda: (final_selection.clear(), update_timetable_view())
+                      ).pack(side='left', fill='x', expand=True, padx=(0, 3))
+        btn_assign = ctk.CTkButton(
+            btn_row1, text='👨‍🏫 시간표 배정', height=34,
+            fg_color='#8e44ad', hover_color='#732d91',
+            command=do_assign
         )
-        self.full_copy_btn.pack(side='bottom', fill='x', padx=10, pady=(5, 20))
+        btn_assign.pack(side='left', fill='x', expand=True, padx=(3, 0))
 
-        self.copy_btn = ctk.CTkButton(
-            left_panel, text='📋 과목별 시간표 복사',
-            fg_color='#27ae60', hover_color='#1e8449',
-            command=send_to_clipboard
-        )
-        self.copy_btn.pack(side='bottom', fill='x', padx=10, pady=(5, 5))
+        btn_row2 = ctk.CTkFrame(footer_panel, fg_color='transparent')
+        btn_row2.pack(fill='x', pady=2)
+        ctk.CTkButton(btn_row2, text='👀 시간표 보기', height=34,
+                      fg_color='#f39c12', hover_color='#d68910',
+                      command=do_view
+                      ).pack(side='left', fill='x', expand=True, padx=(0, 3))
+        ctk.CTkButton(btn_row2, text='📋 칸 복사', height=34,
+                      fg_color='#27ae60', hover_color='#1e8449',
+                      command=copy_subject_timetable
+                      ).pack(side='left', fill='x', expand=True, padx=(3, 3))
+        ctk.CTkButton(btn_row2, text='📝 전체 복사', height=34,
+                      fg_color='#2980b9', hover_color='#1f618d',
+                      command=copy_full_timetable
+                      ).pack(side='left', fill='x', expand=True, padx=(3, 0))
 
-        ctk.CTkButton(
-            left_panel, text='👀 시간표 보기',
-            fg_color='#f39c12', hover_color='#d68910',
-            command=view_timetable
-        ).pack(side='bottom', fill='x', padx=10, pady=10)
+        # ── 종료 처리 ─────────────────────────────────────────
+        def on_close():
+            try:
+                drv = tt_state.get('driver')
+                if drv:
+                    SeleniumManager.safe_quit(drv)
+            except Exception:
+                pass
+            tt_state['driver'] = None
+            pop.destroy()
 
-        ctk.CTkButton(
-            left_panel, text='👨‍🏫 시간표 배정',
-            fg_color='#8e44ad', command=assign_timetable
-        ).pack(side='bottom', fill='x', padx=10, pady=2)
-
-        chk_frame = ctk.CTkFrame(left_panel, fg_color='transparent')
-        chk_frame.pack(side='bottom', fill='x', padx=10, pady=(15, 5))
-        self.chk_weekly_var = ctk.BooleanVar(value=False)
-        self.chk_writing_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(chk_frame, text='주간', variable=self.chk_weekly_var, width=60
-                        ).pack(side='left', padx=(10, 5))
-        ctk.CTkCheckBox(chk_frame, text='필기', variable=self.chk_writing_var, width=60
-                        ).pack(side='left', padx=5)
+        pop.protocol('WM_DELETE_WINDOW', on_close)
 
         init_grid()
         update_subject_list()
 
     # ──────────────────────────────────────────
-    #  시간표 배정 매크로
+    #  시간표 배정 헬퍼 (LMS 드라이버 공유용)
     # ──────────────────────────────────────────
-    def _run_timetable_assignment(self, name: str, assign_weekly=False, assign_writing=False):
-        driver = None
-        try:
-            driver = self._create_lms_driver(name)
-            if not driver:
-                return
-            wait = WebDriverWait(driver, 10)
-            self.write_system_log(f'[{name}] 배정 URL 분석 중...')
-
-            current_url = driver.current_url
-            mid_match = re.search(r'member_id=([^&]+)', current_url)
-            mseq_match = re.search(r'member_seq=([^&]+)', current_url)
-            if not (mid_match and mseq_match):
-                self.write_system_log('오류: 회원 ID/SEQ 추출 실패')
-                return
-
-            parsed = urlparse(current_url)
-            base = f'{parsed.scheme}://{parsed.netloc}'
-            target_url = (
-                f"{base}/wcms/member/memManage/tab/classSearch.asp"
-                f"?member_id={mid_match.group(1)}&member_seq={mseq_match.group(1)}"
-            )
-            driver.get(target_url)
-            wait.until(EC.presence_of_element_located((By.ID, 'key')))
-
-            time_map = {
-                '14:00': '6611', '15:00': '6610', '16:00': '6490', '16:30': '6614',
-                '16:40': '6481', '16:50': '6482', '17:00': '6416', '17:25': '6567',
-                '17:30': '6495', '17:50': '1750', '18:00': '6418', '18:20': '6477',
-                '18:30': '6496', '19:00': '6420', '19:10': '6421', '19:30': '6497',
-                '19:50': '6703', '20:00': '6422', '20:20': '6452', '20:30': '6498',
-                '20:40': '6455', '20:50': '6453', '21:00': '6423', '21:40': '6424',
-                '22:30': '6494', '23:20': '6701',
-            }
-            day_map = {
-                '월': '6502', '화': '6503', '수': '6504', '목': '6505', '금': '6506'
-            }
-
-            for (day, ts), sub in self.final_selection.items():
+    def _tt_ensure_driver(self, tt_state: dict, log_cb):
+        """팝업 전용 드라이버를 lazy 생성한다. 이미 있으면 재사용."""
+        drv = tt_state.get('driver')
+        if drv is not None:
+            try:
+                _ = drv.current_url
+                return drv
+            except Exception:
+                log_cb('LMS 드라이버가 죽어있어 재생성합니다.')
                 try:
-                    self.write_system_log(f'[{sub}] 배정 ({day} {ts})')
+                    SeleniumManager.safe_quit(drv)
+                except Exception:
+                    pass
+                tt_state['driver'] = None
+
+        lms_id, lms_pw = self.cfg.get_credentials()
+        if not lms_id or not lms_pw:
+            log_cb('LMS 계정 정보가 없습니다. 환경설정에서 먼저 입력해주세요.')
+            return None
+        try:
+            log_cb('LMS 드라이버 생성 중...')
+            drv = SeleniumManager.create_incognito()
+            SeleniumManager.lms_login(drv, lms_id, lms_pw)
+            tt_state['driver'] = drv
+            log_cb('LMS 드라이버 준비 완료')
+            return drv
+        except Exception as e:
+            log_cb(f'LMS 드라이버 생성 실패: {e}')
+            SeleniumManager.safe_quit(locals().get('drv'))
+            return None
+
+    def _tt_search_members(self, driver, keyword: str, log_cb, limit: int = 15) -> list:
+        """memList.asp 검색으로 학생 목록 반환."""
+        from urllib.parse import quote_plus
+        keyword = (keyword or '').strip()
+        if not keyword:
+            return []
+        search_url = (
+            'https://www.lmsone.com/wcms/member/memManage/memList.asp'
+            f'?page=1&key=tb1.user_nm&keyWord={quote_plus(keyword)}&onepagerecord=100'
+        )
+        try:
+            driver.get(search_url)
+        except Exception as e:
+            log_cb(f'검색 URL 이동 실패: {e}')
+            return []
+        time.sleep(1.5)
+
+        results = []
+        seen = set()
+        try:
+            html = driver.page_source
+        except Exception:
+            html = ''
+
+        for href, name in re.findall(
+            r'href="([^"]*memWrite\.asp[^"]*member_id=[^"]*member_seq=[^"]*)"[^>]*>([^<]+)</a>',
+            html, re.IGNORECASE,
+        ):
+            name = re.sub(r'\s+', ' ', name).strip()
+            mid = re.search(r'member_id=([^&"\']+)', href)
+            mseq = re.search(r'member_seq=([^&"\']+)', href)
+            if not (name and mid and mseq):
+                continue
+            key = (mid.group(1), mseq.group(1))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                'name': name,
+                'member_id': mid.group(1),
+                'member_seq': mseq.group(1),
+            })
+            if len(results) >= limit:
+                break
+
+        # fallback: DOM 탐색
+        if not results:
+            try:
+                for row in driver.find_elements(
+                    By.CSS_SELECTOR, "table tbody tr, table tr"
+                ):
+                    try:
+                        link = row.find_element(
+                            By.CSS_SELECTOR, "a[href*='memWrite.asp']"
+                        )
+                        href = link.get_attribute('href') or ''
+                        name = re.sub(r'\s+', ' ', (link.text or '').strip())
+                        mid = re.search(r'member_id=([^&]+)', href)
+                        mseq = re.search(r'member_seq=([^&]+)', href)
+                        if not (name and mid and mseq):
+                            continue
+                        k = (mid.group(1), mseq.group(1))
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        results.append({
+                            'name': name,
+                            'member_id': mid.group(1),
+                            'member_seq': mseq.group(1),
+                        })
+                        if len(results) >= limit:
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        return results
+
+    def _tt_fetch_current_timetable(self, driver, member_id: str, member_seq: str, log_cb):
+        """memAirClass.asp 탭에서 현재 배정된 시간표를 파싱한다."""
+        member_id = (member_id or '').strip()
+        member_seq = (member_seq or '').strip()
+        if not member_id or not member_seq:
+            return False, 'member_id / member_seq 정보가 없습니다.'
+
+        try:
+            # 상세 페이지에서 학년 추출
+            detail_url = (
+                'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
+                f'?mode=U&member_id={member_id}&member_seq={member_seq}'
+            )
+            driver.get(detail_url)
+            time.sleep(1.2)
+            basic = self._tt_extract_basic_info(driver)
+
+            # 방송수업 탭으로 이동
+            tt_url = (
+                'https://www.lmsone.com/wcms/member/memManage/tab/memAirClass.asp'
+                f'?member_id={member_id}&member_seq={member_seq}'
+            )
+            driver.get(tt_url)
+            time.sleep(1.3)
+
+            entries, weekly, writing = self._tt_parse_current_rows(driver)
+            return True, {
+                'name': basic.get('name', ''),
+                'grade': basic.get('grade', ''),
+                'member_id': member_id,
+                'member_seq': member_seq,
+                'entries': entries,
+                'subjects': sorted({e['subject'] for e in entries if e.get('subject')}),
+                'weekly': weekly,
+                'writing': writing,
+            }
+        except Exception as e:
+            return False, f'시간표 파싱 실패: {str(e)[:150]}'
+
+    @staticmethod
+    def _tt_extract_basic_info(driver) -> dict:
+        """상세페이지에서 이름/학년 파싱."""
+        def _sel_value(sid: str) -> str:
+            try:
+                return driver.execute_script(
+                    f"var s=document.getElementById('{sid}'); return s ? s.value : '';"
+                ) or ''
+            except Exception:
+                return ''
+
+        def _input_value(name: str) -> str:
+            try:
+                el = driver.find_element(By.NAME, name)
+                return el.get_attribute('value') or ''
+            except Exception:
+                return ''
+
+        school_map = {'E': '초', 'M': '중', 'H': '고'}
+        grade_map = {
+            '1': '1', '2': '2', '3': '3', '4': '4', '5': '5', '6': '6',
+            '01': '1', '02': '2', '03': '3', '04': '4', '05': '5', '06': '6',
+        }
+        school_grade_val = _sel_value('school_grade')
+        school_year_val = _sel_value('school_year_cd')
+        raw_name = _input_value('user_nm')
+        clean_name = re.sub(r'[A-Za-z]$', '', raw_name).strip()
+        return {
+            'name': clean_name,
+            'grade': (
+                f"{school_map.get(school_grade_val, '')}"
+                f"{grade_map.get(school_year_val, '')}"
+            ).strip(),
+        }
+
+    @staticmethod
+    def _tt_parse_current_rows(driver):
+        """table.boardList 에서 현재 배정된 (요일, 시간, 과목, 체크박스정보) 파싱."""
+        entries = []
+        weekly = False
+        writing = False
+        seen = set()
+
+        try:
+            raw_entries = driver.execute_script(
+                """
+                const table = document.querySelector("table.boardList");
+                if (!table) return [];
+                const dayNames = ["월","화","수","목","금","토","일"];
+                const rows = [];
+                table.querySelectorAll("tbody tr").forEach(function(tr) {
+                    const cells = tr.querySelectorAll("td");
+                    if (!cells.length) return;
+                    const timeCell = cells[0];
+                    const timeText = (timeCell.innerText || "").trim().split("~")[0].trim();
+                    dayNames.forEach(function(day, dayIndex) {
+                        const td = cells[dayIndex + 1];
+                        if (!td) return;
+                        const anchors = Array.from(td.querySelectorAll("a"));
+                        const checkboxes = Array.from(td.querySelectorAll("input[type='checkbox'][name='ChkOnair[]']"));
+                        anchors.forEach(function(anchor, idx) {
+                            rows.push({
+                                day: day,
+                                time: timeText,
+                                subject: (anchor.innerText || "").trim(),
+                                checkbox_name: checkboxes[idx] ? (checkboxes[idx].name || "") : "",
+                                checkbox_value: checkboxes[idx] ? (checkboxes[idx].value || "") : "",
+                            });
+                        });
+                    });
+                });
+                return rows;
+                """
+            ) or []
+        except Exception:
+            raw_entries = []
+
+        def _norm_time(raw: str) -> str:
+            m = re.search(r'(\d{1,2}):(\d{2})', raw or '')
+            if not m:
+                return ''
+            return f'{int(m.group(1)):02d}:{m.group(2)}'
+
+        for item in raw_entries:
+            subject = (item.get('subject') or '').strip()
+            if not subject:
+                continue
+            if '주간' in subject:
+                weekly = True
+            if '필기' in subject:
+                writing = True
+            entry = {
+                'subject': subject,
+                'day': (item.get('day') or '').strip(),
+                'time': _norm_time(item.get('time', '')),
+                'checkbox_name': item.get('checkbox_name', ''),
+                'checkbox_value': item.get('checkbox_value', ''),
+            }
+            key = (entry['subject'], entry['day'], entry['time'], entry['checkbox_value'])
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
+        return entries, weekly, writing
+
+    def _tt_run_assign(self, driver, member_id: str, member_seq: str,
+                       final_selection: dict, assign_weekly: bool, assign_writing: bool,
+                       existing_entries: list, managed_subjects: list, log_cb) -> bool:
+        """기존 관리 대상 시간표를 먼저 삭제한 뒤 final_selection 을 재배정."""
+        time_map = {
+            '14:00': '6611', '15:00': '6610', '16:00': '6490', '16:30': '6614',
+            '16:40': '6481', '16:50': '6482', '17:00': '6416', '17:25': '6567',
+            '17:30': '6495', '17:50': '1750', '18:00': '6418', '18:20': '6477',
+            '18:30': '6496', '19:00': '6420', '19:10': '6421', '19:30': '6497',
+            '19:50': '6703', '20:00': '6422', '20:20': '6452', '20:30': '6498',
+            '20:40': '6455', '20:50': '6453', '21:00': '6423', '21:40': '6424',
+            '22:30': '6494', '23:20': '6701',
+        }
+        day_map = {'월': '6502', '화': '6503', '수': '6504', '목': '6505', '금': '6506'}
+
+        def _norm(s: str) -> str:
+            return re.sub(r'\s+', '', (s or '').strip()).lower()
+
+        def _is_managed(subject: str) -> bool:
+            sk = _norm(subject)
+            if not sk:
+                return False
+            for cand in managed_subjects or []:
+                ck = _norm(cand)
+                if ck and ck in sk:
+                    return True
+            return False
+
+        try:
+            # 1) 현재 시간표 페이지 재이동 → 삭제 처리
+            tt_url = (
+                'https://www.lmsone.com/wcms/member/memManage/tab/memAirClass.asp'
+                f'?member_id={member_id}&member_seq={member_seq}'
+            )
+            driver.get(tt_url)
+            time.sleep(1.3)
+
+            if existing_entries:
+                try:
+                    parsed_entries, _, _ = self._tt_parse_current_rows(driver)
+                    target_keys = {
+                        (
+                            (it.get('subject') or '').strip(),
+                            (it.get('day') or '').strip(),
+                            re.sub(r'[^0-9:]', '', (it.get('time') or '')),
+                        )
+                        for it in existing_entries
+                    }
+
+                    extra_delete_labels = set()
+                    if assign_weekly:
+                        extra_delete_labels.add('주간')
+                    if assign_writing:
+                        extra_delete_labels.add('필기')
+
+                    delete_targets = []
+                    for it in parsed_entries:
+                        subject_text = (it.get('subject') or '').strip()
+                        k = (
+                            subject_text,
+                            (it.get('day') or '').strip(),
+                            re.sub(r'[^0-9:]', '', (it.get('time') or '')),
+                        )
+                        if (k in target_keys and _is_managed(subject_text)) or \
+                           any(lbl in subject_text for lbl in extra_delete_labels):
+                            delete_targets.append(it)
+
+                    if delete_targets:
+                        for it in delete_targets:
+                            try:
+                                cb = driver.find_element(
+                                    By.XPATH,
+                                    f"//input[@type='checkbox' and @name='{it['checkbox_name']}' and @value='{it['checkbox_value']}']"
+                                )
+                                if not cb.is_selected():
+                                    driver.execute_script('arguments[0].click();', cb)
+                            except Exception:
+                                continue
+                        try:
+                            del_btn = driver.find_element(
+                                By.XPATH,
+                                "//input[@type='button' and @value='선택삭제']"
+                            )
+                            driver.execute_script('arguments[0].click();', del_btn)
+                            for _ in range(2):
+                                try:
+                                    WebDriverWait(driver, 2).until(
+                                        EC.alert_is_present()).accept()
+                                    time.sleep(0.4)
+                                except Exception:
+                                    break
+                            log_cb(f'기존 시간표 {len(delete_targets)}건 삭제 완료')
+                            time.sleep(1.0)
+                        except Exception as e:
+                            log_cb(f'삭제 버튼 클릭 실패: {e}')
+                    else:
+                        log_cb('삭제할 기존 시간표가 없습니다.')
+                except Exception as e:
+                    log_cb(f'기존 시간표 정리 실패: {e}')
+
+            # 2) 배정 페이지로 이동
+            assign_url = (
+                'https://www.lmsone.com/wcms/member/memManage/tab/classSearch.asp'
+                f'?member_id={member_id}&member_seq={member_seq}'
+            )
+            driver.get(assign_url)
+            time.sleep(1.2)
+            wait = WebDriverWait(driver, 10)
+
+            success = 0
+            for (day, ts), sub in final_selection.items():
+                try:
+                    log_cb(f'[{sub}] 배정 ({day} {ts})')
                     Select(
                         wait.until(EC.presence_of_element_located((By.ID, 'key')))
                     ).select_by_value('tb1.onair_nm')
@@ -2531,54 +3605,56 @@ class AraonWorkstation(ctk.CTk):
                     kw.clear()
                     kw.send_keys(sub)
 
-                    t_val = time_map.get(ts, '')
-                    if t_val:
-                        Select(
-                            driver.find_element(By.ID, 'sh_school_time')
-                        ).select_by_value(t_val)
+                    try:
+                        Select(driver.find_element(By.ID, 'sh_school_time')
+                               ).select_by_index(0)
+                    except Exception:
+                        pass
+                    if ts in time_map:
+                        Select(driver.find_element(By.ID, 'sh_school_time')
+                               ).select_by_value(time_map[ts])
 
                     for cb in driver.find_elements(By.NAME, 'sh_week_gb'):
                         if cb.is_selected():
                             driver.execute_script('arguments[0].click();', cb)
-
-                    d_val = day_map.get(day)
-                    if d_val:
+                    if day in day_map:
                         tgt = driver.find_element(
                             By.XPATH,
-                            f"//input[@name='sh_week_gb' and @value='{d_val}']"
+                            f"//input[@name='sh_week_gb' and @value='{day_map[day]}']"
                         )
                         driver.execute_script('arguments[0].click();', tgt)
 
-                    srch = driver.find_element(
+                    driver.find_element(
                         By.XPATH,
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
-                    )
-                    driver.execute_script('arguments[0].click();', srch)
+                    ).click()
 
-                    checkbox = WebDriverWait(driver, 3).until(
+                    checkbox = WebDriverWait(driver, 4).until(
                         EC.presence_of_element_located((By.NAME, 'onair_seqs'))
                     )
                     driver.execute_script('arguments[0].click();', checkbox)
 
-                    assign_btn = driver.find_element(
-                        By.XPATH, "//input[@type='button' and @value='방송수업개별배정']"
-                    )
-                    driver.execute_script('arguments[0].click();', assign_btn)
+                    driver.find_element(
+                        By.XPATH,
+                        "//input[@type='button' and @value='방송수업개별배정']"
+                    ).click()
 
                     for _ in range(2):
                         try:
-                            WebDriverWait(driver, 2).until(EC.alert_is_present()).accept()
-                            time.sleep(0.5)
+                            WebDriverWait(driver, 2).until(
+                                EC.alert_is_present()).accept()
+                            time.sleep(0.4)
                         except Exception:
                             break
-                    self.write_system_log(f'[{sub}] 배정 성공')
-
+                    success += 1
+                    log_cb(f'[{sub}] 배정 성공')
                 except Exception as e:
-                    self.write_system_log(f'[{sub}] 배정 실패 (건너뜀): {e}')
+                    log_cb(f'[{sub}] 배정 실패: {str(e)[:120]}')
 
-            for extra in (['주간'] if assign_weekly else []) + (['필기'] if assign_writing else []):
+            for extra in ((['주간'] if assign_weekly else [])
+                          + (['필기'] if assign_writing else [])):
                 try:
-                    self.write_system_log(f'[{extra}] 특수방 배정...')
+                    log_cb(f'[{extra}] 특수방 배정 시도')
                     Select(
                         wait.until(EC.presence_of_element_located((By.ID, 'key')))
                     ).select_by_value('tb1.onair_nm')
@@ -2586,65 +3662,355 @@ class AraonWorkstation(ctk.CTk):
                     kw.clear()
                     kw.send_keys(extra)
                     try:
-                        Select(driver.find_element(By.ID, 'sh_school_time')).select_by_index(0)
+                        Select(driver.find_element(By.ID, 'sh_school_time')
+                               ).select_by_index(0)
                     except Exception:
                         pass
                     for cb in driver.find_elements(By.NAME, 'sh_week_gb'):
                         if cb.is_selected():
                             driver.execute_script('arguments[0].click();', cb)
 
-                    srch = driver.find_element(
+                    driver.find_element(
                         By.XPATH,
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
-                    )
-                    driver.execute_script('arguments[0].click();', srch)
-                    checkbox = WebDriverWait(driver, 3).until(
+                    ).click()
+                    checkbox = WebDriverWait(driver, 4).until(
                         EC.presence_of_element_located((By.NAME, 'onair_seqs'))
                     )
                     driver.execute_script('arguments[0].click();', checkbox)
-                    assign_btn = driver.find_element(
-                        By.XPATH, "//input[@type='button' and @value='방송수업개별배정']"
-                    )
-                    driver.execute_script('arguments[0].click();', assign_btn)
+                    driver.find_element(
+                        By.XPATH,
+                        "//input[@type='button' and @value='방송수업개별배정']"
+                    ).click()
                     for _ in range(2):
                         try:
-                            WebDriverWait(driver, 2).until(EC.alert_is_present()).accept()
-                            time.sleep(0.5)
+                            WebDriverWait(driver, 2).until(
+                                EC.alert_is_present()).accept()
+                            time.sleep(0.4)
                         except Exception:
                             break
-                    self.write_system_log(f'[{extra}] 방 배정 성공')
+                    log_cb(f'[{extra}] 특수방 배정 성공')
                 except Exception as e:
-                    self.write_system_log(f'[{extra}] 배정 실패: {e}')
+                    log_cb(f'[{extra}] 특수방 배정 실패: {str(e)[:120]}')
 
-            self.write_system_log(f'[{name}] 모든 배정 완료. 종료...')
-            time.sleep(3)
+            return success > 0
         except Exception as e:
-            self.write_system_log(f'시간표 배정 에러: {e}')
-        finally:
-            SeleniumManager.safe_quit(driver)
+            log_cb(f'시간표 배정 오류: {e}')
+            return False
 
-    def _run_view_timetable(self, name: str):
-        driver = None
+    def _tt_view_timetable(self, driver, member_id: str, member_seq: str,
+                           name: str, log_cb):
+        """상세 페이지로 이동해 pro_tab4(시간표 조회) 창을 연다."""
         try:
-            driver = self._create_lms_driver(name)
-            if not driver:
-                return
+            detail_url = (
+                'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
+                f'?mode=U&member_id={member_id}&member_seq={member_seq}'
+            )
+            driver.get(detail_url)
+            time.sleep(1.2)
             wait = WebDriverWait(driver, 10)
             tab_btn = wait.until(EC.element_to_be_clickable((By.ID, 'pro_tab4')))
             driver.execute_script('arguments[0].click();', tab_btn)
             time.sleep(1.0)
 
-            all_wins = driver.window_handles
-            last = all_wins[-1]
-            for w in all_wins:
-                if w != last:
-                    driver.switch_to.window(w)
-                    driver.close()
-            driver.switch_to.window(last)
-            self.write_system_log(f'[{name}] 시간표 조회 완료')
+            # 새 창이 열렸으면 해당 창으로 포커스 이동
+            handles = driver.window_handles
+            if len(handles) > 1:
+                driver.switch_to.window(handles[-1])
+            log_cb(f'[{name}] 시간표 조회 창 열림')
         except Exception as e:
-            self.write_system_log(f'시간표 보기 에러: {e}')
+            log_cb(f'[{name}] 시간표 보기 실패: {e}')
+
+    # ──────────────────────────────────────────
+    #  첫수업명단 출석체크 저장
+    # ──────────────────────────────────────────
+    def _parse_first_class_date(self, val: str) -> str | None:
+        """첫수업일 값을 LMS 입력 포맷(YYYY-MM-DD)으로 변환. 실패 시 None."""
+        import re, datetime
+        val = (val or '').strip()
+        if not val:
+            return None
+        # YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD
+        m = re.match(r'^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$', val)
+        if m:
+            y, mo, d = m.groups()
+            return f'{int(y):04d}-{int(mo):02d}-{int(d):02d}'
+        # M/D or M.D → 현재 연도 사용
+        m = re.match(r'^(\d{1,2})[/.](\d{1,2})$', val)
+        if m:
+            mo, d = m.groups()
+            y = datetime.date.today().year
+            return f'{y:04d}-{int(mo):02d}-{int(d):02d}'
+        return None
+
+    @staticmethod
+    def _add_months(date_str: str, months: int) -> str:
+        """YYYY-MM-DD + N개월 (월말 처리 포함)."""
+        import calendar
+        y, m, d = map(int, date_str.split('-'))
+        m_total = m + months
+        y += (m_total - 1) // 12
+        m = ((m_total - 1) % 12) + 1
+        d = min(d, calendar.monthrange(y, m)[1])
+        return f'{y:04d}-{m:02d}-{d:02d}'
+
+    @staticmethod
+    def _switch_to_detail_frame(driver) -> bool:
+        """LMS 학생 상세페이지의 user_id 입력이 있는 프레임으로 전환."""
+        driver.switch_to.default_content()
+        if driver.find_elements(By.ID, 'user_id'):
+            return True
+        frames = (
+            driver.find_elements(By.TAG_NAME, 'iframe') +
+            driver.find_elements(By.TAG_NAME, 'frame')
+        )
+        for frame in frames:
+            try:
+                driver.switch_to.default_content()
+                driver.switch_to.frame(frame)
+                if driver.find_elements(By.ID, 'user_id'):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def start_attend_check(self):
+        if self._attend_check_running:
+            messagebox.showwarning('경고', '이미 출석체크 저장이 진행 중입니다.')
+            return
+        # 첫수업명단 시트 읽기
+        try:
+            students = self.sheet_mgr.load_first_class_list()
+        except Exception as e:
+            messagebox.showerror('오류', f'첫수업명단 시트 읽기 실패:\n{e}')
+            return
+        if not students:
+            messagebox.showinfo('알림', '첫수업명단 시트에 학생이 없습니다.')
+            return
+
+        total = len(students)
+        no_date = sum(1 for s in students if not self._parse_first_class_date(s['first_class']))
+        msg = (
+            f'첫수업명단 {total}명의 출석체크를 저장하시겠습니까?\n\n'
+            f'• 출석체크: Y\n'
+            f'• 시작일: R열 첫수업일\n'
+            f'• 종료일: GT-BASIC/GT-LINK/무료체험 +2개월,\n'
+            f'         GT-PRO +6개월\n\n'
+            + (f'⚠ 날짜 누락 {no_date}명은 자동 스킵됩니다.\n' if no_date else '')
+            + '(대상 외 회원구분은 스킵)'
+        )
+        if not messagebox.askyesno('확인', msg):
+            return
+
+        self._attend_check_running = True
+        threading.Thread(
+            target=self._run_attend_check,
+            args=(students,), daemon=True
+        ).start()
+
+    def _run_attend_check(self, students: list[dict]):
+        """
+        첫수업명단 학생들의 출석체크 저장 매크로.
+        회원관리 메뉴 권한이 없는 계정도 URL 직결로 접근.
+        """
+        lms_id, lms_pw = self.cfg.get_credentials()
+        driver = None
+        success = 0
+        skipped_nodate = 0
+        skipped_nofound = 0
+        skipped_nogb = 0
+        errors = 0
+        try:
+            total = len(students)
+            self.write_system_log(f'출석체크 저장 시작 — 총 {total}명')
+            driver = SeleniumManager.create_incognito()
+            SeleniumManager.lms_login(driver, lms_id, lms_pw)
+            wait = WebDriverWait(driver, 10)
+            short_wait = WebDriverWait(driver, 3)
+
+            # 회원구분 → 추가 개월수 매핑
+            # 1403=GT-BASIC, 1419=GT-LINK, 1401=무료체험회원 → +2
+            # 1420=GT-PRO → +6
+            months_map = {'1403': 2, '1419': 2, '1401': 2, '1420': 6}
+            label_map = {'1403': 'GT-BASIC', '1419': 'GT-LINK',
+                         '1401': '무료체험회원', '1420': 'GT-PRO'}
+
+            for idx, student in enumerate(students, 1):
+                name = student['name']
+                sdate_raw = student.get('first_class', '')
+                sdate = self._parse_first_class_date(sdate_raw)
+                tag = f'[{idx}/{total}]'
+
+                if not sdate:
+                    self.write_system_log(
+                        f'{tag} {name} — 첫수업일 없음/파싱 실패("{sdate_raw}") 스킵'
+                    )
+                    skipped_nodate += 1
+                    continue
+
+                try:
+                    # 1. 회원검색 (직결 URL — 메뉴 권한 우회)
+                    driver.get(
+                        'https://www.lmsone.com/wcms/member/memManage/memList.asp'
+                    )
+                    search_box = wait.until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR,
+                             "input[name='keyword'], input[name='keyWord']")
+                        )
+                    )
+                    driver.execute_script(
+                        f"arguments[0].value = '{name}';", search_box
+                    )
+                    search_box.send_keys(Keys.ENTER)
+                    time.sleep(0.5)
+
+                    # 2. 결과 링크 찾기
+                    name_norm = ' '.join(name.strip().split()).lower()
+                    target_link = None
+                    for link in driver.find_elements(
+                        By.CSS_SELECTOR, 'table tbody tr a'
+                    ):
+                        link_norm = ' '.join(link.text.strip().split()).lower()
+                        if (link_norm == name_norm
+                                or link_norm.startswith(name_norm + '(')):
+                            target_link = link
+                            break
+                    if not target_link:
+                        self.write_system_log(
+                            f'{tag} {name} — 검색 결과 없음, 스킵'
+                        )
+                        skipped_nofound += 1
+                        continue
+
+                    # 3. 상세페이지 열기 (새창)
+                    main_win = driver.current_window_handle
+                    driver.execute_script('arguments[0].click();', target_link)
+                    wait.until(lambda d: len(d.window_handles) > 1)
+                    detail_win = next(
+                        w for w in driver.window_handles if w != main_win
+                    )
+                    driver.switch_to.window(detail_win)
+
+                    # 4. 상세 프레임 진입
+                    if not self._switch_to_detail_frame(driver):
+                        self.write_system_log(
+                            f'{tag} {name} — 상세 프레임 탐색 실패, 스킵'
+                        )
+                        errors += 1
+                        driver.close()
+                        driver.switch_to.window(main_win)
+                        continue
+
+                    # 5. 회원구분 읽기 → +개월 결정
+                    try:
+                        gb_el = driver.find_element(By.ID, 'member_gb')
+                        gb_value = (
+                            Select(gb_el).first_selected_option
+                            .get_attribute('value') or ''
+                        ).strip()
+                    except Exception:
+                        gb_value = ''
+
+                    if gb_value not in months_map:
+                        self.write_system_log(
+                            f'{tag} {name} — 회원구분({gb_value or "없음"}) 대상 아님, 스킵'
+                        )
+                        skipped_nogb += 1
+                        driver.close()
+                        driver.switch_to.window(main_win)
+                        continue
+
+                    months = months_map[gb_value]
+                    edate = self._add_months(sdate, months)
+
+                    # 6. 출석체크 Y (체크 안 되어 있으면 토글)
+                    try:
+                        cb = driver.find_element(By.ID, 'attend_yn')
+                        if not cb.is_selected():
+                            driver.execute_script('arguments[0].click();', cb)
+                    except Exception as e:
+                        self.write_system_log(
+                            f'{tag} {name} — 출석체크 체크박스 없음: {e}'
+                        )
+
+                    # 7. 날짜 주입 (readonly 필드 → JS)
+                    driver.execute_script(
+                        "var s=document.getElementsByName('attend_Sdate');"
+                        "if(s.length) s[0].value=arguments[0];"
+                        "var e=document.getElementsByName('attend_Edate');"
+                        "if(e.length) e[0].value=arguments[1];",
+                        sdate, edate
+                    )
+
+                    # 8. 저장 버튼
+                    try:
+                        save_btn = driver.find_element(
+                            By.XPATH,
+                            "//input[@type='button' and @name='학생정보저장']"
+                        )
+                        driver.execute_script('arguments[0].click();', save_btn)
+                    except Exception:
+                        driver.execute_script('Submit();')
+
+                    # 저장 확인 alert
+                    try:
+                        short_wait.until(EC.alert_is_present()).accept()
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+                    # 혹시 연속 alert
+                    try:
+                        driver.switch_to.alert.accept()
+                    except Exception:
+                        pass
+
+                    self.write_system_log(
+                        f'{tag} {name} ✓ '
+                        f'({label_map[gb_value]} · {sdate} ~ {edate})'
+                    )
+                    success += 1
+
+                    # 상세창 닫고 메인 복귀
+                    try:
+                        driver.close()
+                    except Exception:
+                        pass
+                    driver.switch_to.window(main_win)
+
+                except Exception as e:
+                    self.write_system_log(f'{tag} {name} 오류: {e}')
+                    errors += 1
+                    # 창 정리
+                    try:
+                        while len(driver.window_handles) > 1:
+                            driver.switch_to.window(driver.window_handles[-1])
+                            driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+                    except Exception:
+                        pass
+
+            summary = (
+                f'출석체크 저장 완료\n\n'
+                f'✓ 성공: {success}명\n'
+                f'⏭ 날짜 없음: {skipped_nodate}명\n'
+                f'⏭ 검색 결과 없음: {skipped_nofound}명\n'
+                f'⏭ 회원구분 대상 외: {skipped_nogb}명\n'
+                f'✗ 오류: {errors}명'
+            )
+            self.write_system_log(
+                f'출석체크 저장 완료 — 성공 {success} / '
+                f'날짜없음 {skipped_nodate} / 결과없음 {skipped_nofound} / '
+                f'대상외 {skipped_nogb} / 오류 {errors}'
+            )
+            self.after(0, lambda: messagebox.showinfo('완료', summary))
+
+        except Exception as e:
+            self.write_system_log(f'출석체크 저장 치명적 오류: {e}')
+            self.after(0, lambda: messagebox.showerror('오류', str(e)))
+        finally:
             SeleniumManager.safe_quit(driver)
+            self._attend_check_running = False
 
     # ──────────────────────────────────────────
     #  일괄 강의방 등록
@@ -2656,49 +4022,67 @@ class AraonWorkstation(ctk.CTk):
         if not self.current_data_cache:
             messagebox.showwarning('경고', '불러온 학생 데이터가 없습니다.')
             return
+
+        # settings.ini 의 수업방 URL 우선 사용 (구버전 admission_room_url 도 fallback)
+        url = (self.cfg.get('LMS', 'class_room_url', '').strip()
+               or self.cfg.get('LMS', 'admission_room_url', '').strip())
+        if not url:
+            messagebox.showwarning(
+                '설정 필요',
+                '수업방 URL이 설정되어 있지 않습니다.\n\n'
+                '환경설정 → 🎓 수업방 URL 설정 에서 본인 수업방 '
+                '(개통방/입학식방 등) URL을 입력해주세요.'
+            )
+            return
+
         count = len(self.current_data_cache)
         if not messagebox.askyesno(
             '확인',
-            f'현재 목록 학생 {count}명을 개통방에 일괄 등록하시겠습니까?\n'
+            f'본인 수업방에 학생 {count}명을 일괄 등록하시겠습니까?\n'
             f'(기존 학생은 초기화됩니다)'
         ):
             return
         self._bulk_enroll_running = True
-        threading.Thread(target=self._run_bulk_enroll, daemon=True).start()
+        threading.Thread(
+            target=self._run_bulk_enroll,
+            args=(url,), daemon=True
+        ).start()
 
-    def _run_bulk_enroll(self):
+    def _run_bulk_enroll(self, room_url: str):
+        """
+        일괄 강의방 등록 (URL 직접 이동 방식).
+        환경설정의 수업방 URL 로 이동 → 기존 학생 삭제 → 신규 학생 등록.
+        """
         lms_id, lms_pw = self.cfg.get_credentials()
         driver = None
         try:
-            self.write_system_log('일괄 등록 매크로 시작...')
+            self.write_system_log('일괄 강의방 등록 매크로 시작...')
             driver = SeleniumManager.create_incognito()
             wait = SeleniumManager.lms_login(driver, lms_id, lms_pw)
             short_wait = WebDriverWait(driver, 3)
 
-            folder = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//span[@class='folder' and contains(text(), '방송수업관리')]")
-                )
-            )
-            driver.execute_script('arguments[0].click();', folder)
-            time.sleep(0.5)
-
-            file_link = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//span[@class='file' and contains(text(), '정규방송-코칭')]")
-                )
-            )
-            driver.execute_script('arguments[0].click();', file_link)
-
-            class_link = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//a[contains(text(), '개통방(서우석 선생님)')]")
-                )
-            )
-            driver.execute_script('arguments[0].click();', class_link)
+            # ── URL 직접 이동 ──
+            self.write_system_log(f'수업방으로 이동: {room_url[:80]}...')
+            driver.get(room_url)
             time.sleep(2.0)
 
-            # 기존 학생 삭제
+            # 페이지가 완전히 로드될 때까지 검색 버튼 등장 대기
+            try:
+                wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
+                    )
+                )
+            except Exception as e:
+                self.write_system_log(f'수업방 페이지 로드 실패: {e}')
+                self.after(0, lambda: messagebox.showerror(
+                    '오류',
+                    '수업방 페이지를 불러오지 못했습니다.\n'
+                    '환경설정 → 🎓 수업방 URL 설정 에서 올바른 URL 인지 확인해주세요.'
+                ))
+                return
+
+            # ── 기존 학생 전체 삭제 ──
             try:
                 self.write_system_log('기존 학생 전체 삭제 중...')
                 driver.execute_script(
@@ -2720,6 +4104,7 @@ class AraonWorkstation(ctk.CTk):
             except Exception as e:
                 self.write_system_log(f'삭제 시도 (비어있음 또는 실패): {e}')
 
+            # ── 학생 검색 팝업 열기 ──
             search_btn = wait.until(
                 EC.presence_of_element_located(
                     (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
@@ -2734,6 +4119,7 @@ class AraonWorkstation(ctk.CTk):
                     driver.switch_to.window(wh)
                     break
 
+            # ── 학생별 등록 ──
             success_count = 0
             for row in self.current_data_cache:
                 if len(row) < 2:
@@ -2804,10 +4190,10 @@ class AraonWorkstation(ctk.CTk):
 
             driver.close()
             driver.switch_to.window(main_window)
-            self.write_system_log(f'일괄 등록 완료! (성공: {success_count}명)')
+            self.write_system_log(f'입학식 일괄 등록 완료! (성공: {success_count}명)')
             self.after(
                 0, lambda: messagebox.showinfo(
-                    '완료', f'일괄 등록 완료\n(성공: {success_count}건)'
+                    '완료', f'입학식 일괄 등록 완료\n(성공: {success_count}건)'
                 )
             )
 
@@ -2826,7 +4212,7 @@ class AraonWorkstation(ctk.CTk):
                 ).start()
 
         except Exception as e:
-            self.write_system_log(f'일괄 등록 치명적 에러: {e}')
+            self.write_system_log(f'입학식 일괄 등록 치명적 에러: {e}')
         finally:
             SeleniumManager.safe_quit(driver)
             self._bulk_enroll_running = False
@@ -2935,7 +4321,7 @@ class AraonWorkstation(ctk.CTk):
     def open_settings_menu(self):
         pop = ctk.CTkToplevel(self)
         pop.title('환경 설정')
-        pop.geometry('350x500')
+        pop.geometry('350x420')
         pop.transient(self)
         pop.focus_force()
 
@@ -2943,8 +4329,8 @@ class AraonWorkstation(ctk.CTk):
             ('📝 AS 상용구 편집', self.popup_as_templates),
             ('⌨ 단축키 및 테마 설정', self.popup_hotkey_theme),
             ('📋 퀵카피 텍스트 편집', self.popup_copy_edit),
-            ('🔑 구글 시트 및 LMS 계정', self.popup_accounts),
-            ('💰 수당 단가 설정', self.popup_rates),
+            ('🔑 LMS 계정 설정', self.popup_accounts),
+            ('🎓 수업방 URL 설정', self.popup_class_room),
         ]:
             ctk.CTkButton(pop, text=label, height=45, command=cmd
                           ).pack(fill='x', padx=30, pady=8)
@@ -3067,8 +4453,8 @@ class AraonWorkstation(ctk.CTk):
 
     def popup_accounts(self):
         pop = ctk.CTkToplevel(self)
-        pop.title('계정 연동 설정')
-        pop.geometry('450x480')
+        pop.title('LMS 계정 설정')
+        pop.geometry('350x250')
         pop.transient(self)
         pop.focus_force()
 
@@ -3080,67 +4466,75 @@ class AraonWorkstation(ctk.CTk):
                 text_color='#e67e22', font=('Pretendard', 11)
             ).pack(pady=(10, 0), padx=20)
 
-        ctk.CTkLabel(pop, text='[ LMS 계정 ]').pack(pady=(15, 5))
+        ctk.CTkLabel(pop, text='[ LMS 계정 ]',
+                     font=('Pretendard', 13, 'bold')).pack(pady=(20, 5))
         lms_id, lms_pw = self.cfg.get_credentials()
-        id_e = ctk.CTkEntry(pop, placeholder_text='ID')
+        id_e = ctk.CTkEntry(pop, width=250, placeholder_text='ID')
         id_e.insert(0, lms_id)
-        id_e.pack()
-        pw_e = ctk.CTkEntry(pop, placeholder_text='PW', show='*')
+        id_e.pack(pady=4)
+        pw_e = ctk.CTkEntry(pop, width=250, placeholder_text='PW', show='*')
         pw_e.insert(0, lms_pw)
-        pw_e.pack(pady=5)
-
-        ctk.CTkLabel(pop, text='[ Google Sheet ]').pack(pady=(20, 5))
-        sid_e = ctk.CTkEntry(pop, width=350, placeholder_text='Spreadsheet ID')
-        sid_e.insert(0, self.cfg.get('MAIN_SHEET', 'SPREADSHEET_ID'))
-        sid_e.pack()
-        sn_e = ctk.CTkEntry(pop, placeholder_text='Sheet Name')
-        sn_e.insert(0, self.cfg.get('MAIN_SHEET', 'SHEET_NAME'))
-        sn_e.pack(pady=5)
+        pw_e.pack(pady=4)
 
         def save():
             self.cfg.set_credentials(id_e.get(), pw_e.get())
-            self.cfg.set('MAIN_SHEET', 'SPREADSHEET_ID', sid_e.get())
-            self.cfg.set('MAIN_SHEET', 'SHEET_NAME', sn_e.get())
             self.cfg.save()
-            self.sheet_mgr.invalidate()  # 캐시 초기화
             pop.destroy()
-            self.write_system_log('계정 및 시트 정보 갱신')
+            self.write_system_log('LMS 계정 갱신')
 
         ctk.CTkButton(pop, text='저장', command=save).pack(pady=20)
 
-    def popup_rates(self):
-        """수당 단가 설정 팝업 (신규)"""
+    def popup_class_room(self):
+        """일괄 등록용 수업방 URL 설정 (개통방/입학식방 등 본인 방)."""
         pop = ctk.CTkToplevel(self)
-        pop.title('수당 단가 설정')
-        pop.geometry('320x250')
+        pop.title('수업방 URL 설정')
+        pop.geometry('560x360')
         pop.transient(self)
         pop.focus_force()
 
-        ctk.CTkLabel(pop, text='카카오 상담 1건 단가 (원)',
-                     font=('Pretendard', 13)).pack(pady=(20, 5))
-        kakao_e = ctk.CTkEntry(pop)
-        kakao_e.insert(0, str(self.cfg.get_kakao_rate()))
-        kakao_e.pack(pady=5)
+        ctk.CTkLabel(
+            pop, text='[ 일괄 강의방 등록 URL ]',
+            font=('Pretendard', 13, 'bold')
+        ).pack(pady=(20, 8))
 
-        ctk.CTkLabel(pop, text='개통/AS 1건 단가 (원)',
-                     font=('Pretendard', 13)).pack(pady=(15, 5))
-        setup_e = ctk.CTkEntry(pop)
-        setup_e.insert(0, str(self.cfg.get_setup_rate()))
-        setup_e.pack(pady=5)
+        ctk.CTkLabel(
+            pop,
+            text=(
+                '본인 수업방의 LMS 페이지 주소를 입력하세요.\n'
+                '(개통방, 입학식방 등 본인이 학생을 등록할 방)\n\n'
+                '1) LMS 로그인 → 방송수업관리 → 정규방송-코칭\n'
+                '2) 본인 수업방 클릭\n'
+                '3) 주소창의 URL 전체를 복사 → 아래에 붙여넣기'
+            ),
+            text_color='#888888', font=('Pretendard', 11),
+            justify='left'
+        ).pack(pady=(0, 12), padx=20)
+
+        url_e = ctk.CTkEntry(
+            pop, width=500,
+            placeholder_text='https://www.lmsone.com/wcms/onAirClass/onAirClassWrite.asp?...'
+        )
+        # 구버전 호환: admission_room_url 값도 fallback 으로 읽음
+        current = (self.cfg.get('LMS', 'class_room_url', '')
+                   or self.cfg.get('LMS', 'admission_room_url', ''))
+        url_e.insert(0, current)
+        url_e.pack(pady=4, padx=20)
 
         def save():
-            try:
-                self.cfg.set('SETTINGS', 'kakao_rate', kakao_e.get())
-                self.cfg.set('SETTINGS', 'setup_rate', setup_e.get())
-                self.cfg.save()
-                self.update_kakao_ui()
-                self.load_setup_log()
-                pop.destroy()
-                self.write_system_log('수당 단가 저장')
-            except Exception as e:
-                messagebox.showerror('오류', f'저장 실패: {e}')
+            url = url_e.get().strip()
+            if url and not url.startswith('http'):
+                messagebox.showwarning(
+                    '확인', 'URL은 http:// 또는 https:// 로 시작해야 합니다.',
+                    parent=pop
+                )
+                return
+            self.cfg.set('LMS', 'class_room_url', url)
+            self.cfg.save()
+            pop.destroy()
+            self.write_system_log('수업방 URL 갱신')
 
-        ctk.CTkButton(pop, text='저장', fg_color='#27ae60', command=save).pack(pady=20)
+        ctk.CTkButton(pop, text='저장', command=save,
+                      fg_color='#27ae60').pack(pady=20)
 
 
 # ─────────────────────────────────────────────
