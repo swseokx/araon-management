@@ -303,12 +303,12 @@ class SheetManager:
 
     def get_admission_checklist_by_names(self, names) -> dict[str, dict]:
         """
-        입학식 관리 시트에서 C열 학생명을 대조해 각 학생의 체크리스트를 반환.
+        입학식 관리 시트에서 학생명으로 체크리스트를 반환.
         날짜 필터링 없음 — 이름이 일치하는 가장 마지막(아래쪽) 행 기준.
 
-        시트 열 매핑:
-          C=학생명, F=입학식안내문자, G=카톡, H=레벨, I=노트,
-          J=첫수업, K=폼, L=전체시간표, M=시간표배정
+        신 스키마: C열(idx2)=학생명, F~M(idx5~12)=체크리스트
+        구 스키마: B열(idx1)=학생명, E~L(idx4~11)=체크리스트
+        → 두 스키마 모두 자동 감지.
 
         반환: {학생명(공백제거): {'notice':..., ...}}
         """
@@ -318,23 +318,32 @@ class SheetManager:
         wanted = {str(n).replace(' ', '').strip() for n in names if n}
         result: dict[str, dict] = {}
         for row in all_rows:
-            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
-            if not c_name or c_name not in wanted:
-                continue
-
             def _g(i, r=row):
                 return r[i].strip() if i < len(r) else ''
 
-            # 같은 이름이 여러 행 있으면 마지막 행이 최종값이 되도록 덮어쓰기
-            result[c_name] = {
-                'notice':      _g(5),   # F
-                'kakao':       _g(6),   # G
-                'level':       _g(7),   # H
-                'note':        _g(8),   # I
-                'first_class': _g(9),   # J
-                'form':        _g(10),  # K
-                'tt_send':     _g(11),  # L
-                'schedule':    _g(12),  # M
+            # 신 스키마 우선 (C열), 구 스키마 폴백 (B열)
+            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
+            b_name = (row[1] if len(row) > 1 else '').replace(' ', '').strip()
+
+            if c_name and c_name in wanted:
+                matched_name = c_name
+                offset = 5   # F=idx5 시작 (신 스키마)
+            elif b_name and b_name in wanted:
+                matched_name = b_name
+                offset = 4   # E=idx4 시작 (구 스키마)
+            else:
+                continue
+
+            # 같은 이름 여러 행 → 마지막 행이 최종값
+            result[matched_name] = {
+                'notice':      _g(offset),      # F(신) / E(구)
+                'kakao':       _g(offset + 1),  # G / F
+                'level':       _g(offset + 2),  # H / G
+                'note':        _g(offset + 3),  # I / H
+                'first_class': _g(offset + 4),  # J / I
+                'form':        _g(offset + 5),  # K / J
+                'tt_send':     _g(offset + 6),  # L / K
+                'schedule':    _g(offset + 7),  # M / L
             }
         return result
 

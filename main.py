@@ -2317,14 +2317,18 @@ class AraonWorkstation(ctk.CTk):
         today_str = f'{datetime.now().month}/{datetime.now().day}'
         student_vars_list = []
 
-        CHECKS = [
-            ('notice',     '입학식안내문자'),
-            ('kakao',      '카톡등록'),
-            ('level',      '레벨테스트'),
-            ('note',       '노트'),
-            ('form',       '폼등록'),
-            ('tt_send',    '전체시간표'),
-            ('schedule',   '시간표배정'),
+        # O/X 체크박스 항목
+        CHECKS_BOOL = [
+            ('notice',   '입학식안내문자'),
+            ('note',     '노트'),
+            ('form',     '폼등록'),
+            ('tt_send',  '전체시간표'),
+            ('schedule', '시간표배정'),
+        ]
+        # 드롭다운 항목 (key, label, 선택지 목록)
+        CHECKS_DROPDOWN = [
+            ('kakao', '카톡등록',   [' ', 'O', '모 완', '부 완', '학 완']),
+            ('level', '레벨테스트', [' ', 'O', '수 X', '영수 X', '영 X']),
         ]
 
         for s in students:
@@ -2377,7 +2381,9 @@ class AraonWorkstation(ctk.CTk):
             sheet_data = s.get('sheet_data')  # None 또는 dict
 
             sv = {'student': s, 'save_lms': save_lms_v, '_sheet_data': sheet_data}
-            for key, label in CHECKS:
+
+            # O/X 체크박스
+            for key, label in CHECKS_BOOL:
                 pre_checked = bool(
                     sheet_data and sheet_data.get(key, '').upper() == 'O'
                 )
@@ -2386,6 +2392,22 @@ class AraonWorkstation(ctk.CTk):
                 ctk.CTkCheckBox(
                     cb_row, text=label, variable=var, width=105
                 ).pack(side='left', padx=4)
+
+            # 드롭다운 (카톡등록, 레벨테스트)
+            for key, label, opts in CHECKS_DROPDOWN:
+                raw = (sheet_data.get(key, '') if sheet_data else '').strip()
+                pre_val = raw if raw in opts else ' '
+                ctk.CTkLabel(
+                    cb_row, text=f' {label}:', font=('Pretendard', 12)
+                ).pack(side='left', padx=(6, 2))
+                str_var = ctk.StringVar(value=pre_val)
+                sv[key] = str_var
+                ctk.CTkOptionMenu(
+                    cb_row, variable=str_var, values=opts,
+                    width=90, height=28, font=('Pretendard', 12),
+                    fg_color='#374151', button_color='#4b5563',
+                    button_hover_color='#6b7280',
+                ).pack(side='left', padx=2)
 
             # 첫 수업 일자 — 달력 버튼 (기본값 공백, 클릭 시 달력으로 선택)
             fc_default = ''
@@ -2444,12 +2466,15 @@ class AraonWorkstation(ctk.CTk):
             def _ox(var): return 'O' if var.get() else 'X'
             save_data = []
             for sv in student_vars_list:
+                # kakao/level 은 StringVar (드롭다운), 나머지는 BooleanVar
+                kakao_val = sv['kakao'].get().strip()
+                level_val = sv['level'].get().strip()
                 save_data.append({
                     'student':     sv['student'],
                     'save_lms':    sv['save_lms'].get(),
                     'notice':      _ox(sv['notice']),
-                    'kakao':       _ox(sv['kakao']),
-                    'level':       _ox(sv['level']),
+                    'kakao':       kakao_val if kakao_val and kakao_val != ' ' else 'X',
+                    'level':       level_val if level_val and level_val != ' ' else 'X',
                     'note':        _ox(sv['note']),
                     'first_class': sv['first_class'].get().strip(),
                     'form':        _ox(sv['form']),
