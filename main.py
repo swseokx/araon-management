@@ -2230,19 +2230,26 @@ class AraonWorkstation(ctk.CTk):
                         'p_nm': '-', 'hp': '-', 'p_hp': '-', 'history': ''
                     }
         # 입학식 관리 시트에서 C열(학생명) 기준으로 기존 체크리스트 조회
-        # 같은 이름 있으면 프리체크, 없으면 이후 저장 시 새 행으로 추가됨
         student_names = [s['name'] for s in students]
+        self.write_system_log(f'체크리스트 조회 시작: {student_names}')
+        all_checklists = {}
         try:
             all_checklists = self.sheet_mgr.get_admission_checklist_by_names(
                 student_names
             )
+            self.write_system_log(
+                f'체크리스트 조회 결과: {list(all_checklists.keys()) or "없음"}'
+            )
         except Exception as e:
-            self.write_system_log(f'기존 체크리스트 일괄 조회 오류: {e}')
-            all_checklists = {}
+            import traceback
+            self.write_system_log(f'체크리스트 조회 오류: {e}\n{traceback.format_exc()}')
 
         for s in students:
             clean_name = s['name'].replace(' ', '').strip()
             s['sheet_data'] = all_checklists.get(clean_name)
+            self.write_system_log(
+                f'  {s["name"]} → {"프리체크 있음" if s["sheet_data"] else "없음"}'
+            )
 
         self.after(0, lambda: self._build_admission_popup_ui(students))
 

@@ -59,14 +59,26 @@ class SheetManager:
         return self._sheet
 
     def _get_admission_sheet(self):
-        """입학식 관리 시트 (별도 스프레드시트)."""
+        """입학식 관리 시트 (별도 스프레드시트).
+        sheet_name 으로 먼저 시도, 실패 시 sheet_gid(숫자) 로 폴백.
+        """
         if self._admission_sheet is not None:
             return self._admission_sheet
         client = self._get_client()
         sheet_id = self.cfg.get('ADMISSION', 'spreadsheet_id',
                                 self.cfg.get('MAIN_SHEET', 'SPREADSHEET_ID'))
         sheet_name = self.cfg.get('ADMISSION', 'sheet_name', '입학식 관리')
-        self._admission_sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
+        sheet_gid  = self.cfg.get('ADMISSION', 'sheet_gid', '1161990906')
+        spreadsheet = client.open_by_key(sheet_id)
+        try:
+            self._admission_sheet = spreadsheet.worksheet(sheet_name)
+        except Exception:
+            # 이름으로 못 찾으면 gid 로 폴백
+            try:
+                self._admission_sheet = spreadsheet.get_worksheet_by_id(int(sheet_gid))
+            except Exception:
+                # gid 도 안 되면 첫 번째 시트
+                self._admission_sheet = spreadsheet.get_worksheet(0)
         return self._admission_sheet
 
     def load_day_data(self, selected_date: str) -> tuple[list[list], dict]:
@@ -316,6 +328,12 @@ class SheetManager:
         all_rows = sheet.get_all_values()
 
         wanted = {str(n).replace(' ', '').strip() for n in names if n}
+        # 디버그: 시트의 C열 값 목록 확인 (처음 30행)
+        c_col_sample = [
+            (row[2] if len(row) > 2 else '') for row in all_rows[:30]
+        ]
+        print(f'[DEBUG] wanted={wanted}  C열샘플={c_col_sample}')
+
         result: dict[str, dict] = {}
         for row in all_rows:
             def _g(i, r=row):
