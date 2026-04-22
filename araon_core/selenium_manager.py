@@ -33,19 +33,32 @@ class SeleniumManager:
         return cls._driver_path
 
     @staticmethod
-    def create_incognito(page_load_strategy: str = 'eager') -> webdriver.Chrome:
-        """시크릿 모드 드라이버 (개통/AS/일괄등록 등 LMS 작업용)"""
+    def create_incognito(page_load_strategy: str = 'eager',
+                         background: bool = False) -> webdriver.Chrome:
+        """시크릿 모드 드라이버 (개통/AS/일괄등록 등 LMS 작업용).
+
+        background=True: 생성 직후 창을 최소화하여 배치 작업이 화면을 가리지 않게 한다.
+        """
         path = SeleniumManager._resolve_driver_path()
         opts = Options()
         opts.add_argument('--incognito')
         opts.add_argument('--disable-popup-blocking')
+        if background:
+            # 화면 밖으로 배치 + 이후 minimize — 포커스 스틸 최소화
+            opts.add_argument('--window-position=-32000,-32000')
         opts.page_load_strategy = page_load_strategy
         prefs = {
             "profile.managed_default_content_settings.images": 2,
             "profile.default_content_setting_values.popups": 1,
         }
         opts.add_experimental_option("prefs", prefs)
-        return webdriver.Chrome(service=Service(path), options=opts)
+        drv = webdriver.Chrome(service=Service(path), options=opts)
+        if background:
+            try:
+                drv.minimize_window()
+            except Exception:
+                pass
+        return drv
 
     @staticmethod
     def create_with_profile(profile_dir: str,

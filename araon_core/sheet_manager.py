@@ -39,6 +39,12 @@ class SheetManager:
             self.cfg.base_path,
             self.cfg.get('DEFAULT', 'CREDENTIALS_FILE', 'credentials.json'),
         )
+        if not os.path.exists(creds_path):
+            raise FileNotFoundError(
+                f'credentials.json 파일이 없습니다.\n'
+                f'프로그램 폴더에 credentials.json 을 넣어주세요.\n'
+                f'경로: {creds_path}'
+            )
         creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, _SCOPES)
         self._client = gspread.authorize(creds)
         return self._client
@@ -150,48 +156,75 @@ class SheetManager:
         sheet.update_cell(target_row, 13, 'ㅇ')
         return True
 
+    @staticmethod
+    def _date_full_and_dow(date_str: str) -> tuple[str, str]:
+        """'4/22' → ('4/22 (수)', '(수)'). 실패 시 원본 반환."""
+        from datetime import date as _date
+        try:
+            m_, d_ = map(int, date_str.split('/'))
+            year = _date.today().year
+            dt = _date(year, m_, d_)
+            dow = ['월', '화', '수', '목', '금', '토', '일'][dt.weekday()]
+            return f'{m_}/{d_} ({dow})', f'({dow})'
+        except Exception:
+            return date_str, ''
+
     def write_to_admission_sheet(self, date_str: str, rows: list[list]) -> tuple[int, int]:
         """
-        입학식 등록: 선택 날짜 학생 데이터를 입학식 관리 시트에 추가.
+        입학식 등록: 학생 데이터를 입학식 관리 시트에 추가.
 
-        date_str: "4/11" 형식의 날짜
-        rows: [[학생명, 학년, 입학식시간], ...] 리스트
+        동작:
+          - C열(학생명)에 같은 이름이 이미 있으면 행 추가를 스킵(체크리스트는 별도 업데이트).
+          - 새로 추가할 때 A열 날짜는 해당 날짜가 이미 시트에 있으면 생략(한 번만 표시).
 
-        입학식 관리 시트 열 구조 (A~M):
-          A=날짜, B=학생명, C=학년, D=입학식시간,
-          E=입학식안내문자, F=카톡등록, G=레벨테스트, H=노트,
-          I=첫수업일자, J=폼등록, K=전체시간표발송, L=시간표배정, M=최종확인
+        date_str: "4/22" 형식
+        rows: [[학생명, 학년(무시), 입학식시간], ...]
+
+        시트 스키마:
+          A=날짜("4/22 (수)"), B=요일("(수)"), C=학생명, D=(미사용), E=입학식시간,
+          F=입학식안내문자, G=카톡등록, H=레벨테스트, I=노트,
+          J=첫수업일자, K=폼등록, L=전체시간표발송, M=시간표배정
 
         반환: (추가된 수, 중복 스킵된 수)
         """
         sheet = self._get_admission_sheet()
+        date_full, dow_marker = self._date_full_and_dow(date_str)
 
-        existing = sheet.batch_get(['A:A', 'B:B'])
+        existing = sheet.batch_get(['A:A', 'C:C'])
         a_col = [r[0] if r else '' for r in existing[0]]
-        b_col = [r[0] if r else '' for r in existing[1]]
+        c_col = [r[0] if r else '' for r in existing[1]]
 
-        existing_keys = set()
-        for a_val, b_val in zip(a_col, b_col):
-            key = f"{str(a_val).strip()}_{str(b_val).replace(' ', '').strip()}"
-            existing_keys.add(key)
+        existing_names = {
+            str(c).replace(' ', '').strip()
+            for c in c_col if str(c).strip()
+        }
+        date_already_present = any(
+            str(a).strip() == date_full for a in a_col
+        )
 
         added = 0
         skipped = 0
         new_rows = []
         for row in rows:
-            name  = str(row[0]).replace(' ', '').strip() if len(row) > 0 else ''
-            grade = str(row[1]).strip() if len(row) > 1 else ''
+            name = str(row[0]).replace(' ', '').strip() if len(row) > 0 else ''
             time_ = str(row[2]).strip() if len(row) > 2 else ''
-
-            key = f"{date_str}_{name}"
-            if key in existing_keys:
+            if not name:
+                continue
+            if name in existing_names:
                 skipped += 1
                 continue
 
-            # A=날짜, B=학생명, C=학년, D=입학식시간, E=안내문자, F~L=체크리스트, M=최종확인
-            new_rows.append([date_str, name, grade, time_,
-                              '', '', '', '', '', '', '', '', ''])
-            existing_keys.add(key)
+            # 첫 번째로 이 날짜가 추가될 때만 A 채우고, 이후는 공란
+            a_val = '' if date_already_present else date_full
+            if not date_already_present:
+                date_already_present = True
+
+            # A, B, C, D(미사용), E(시간), F~M(체크리스트 공란)
+            new_rows.append([
+                a_val, dow_marker, name, '', time_,
+                '', '', '', '', '', '', '', ''
+            ])
+            existing_names.add(name)
             added += 1
 
         if new_rows:
@@ -200,36 +233,33 @@ class SheetManager:
         return added, skipped
 
     def update_admission_checklist(
-        self, date_str: str, name: str,
+        self, name: str,
+        notice_msg: str,
         kakao: str, level_test: str, note: str, first_class: str,
         form_reg: str, timetable_send: str, schedule: str
     ) -> bool:
         """
-        입학식 관리 시트에서 날짜+학생명으로 행을 찾아 체크리스트(F~M) 업데이트.
-        kakao/level_test/note/form_reg/timetable_send/schedule: 'O' 또는 'X'
+        입학식 관리 시트에서 C열(학생명)으로 행을 찾아 체크리스트(F~M) 업데이트.
+        notice_msg/kakao/level_test/note/form_reg/timetable_send/schedule: 'O' 또는 'X'
         first_class: 날짜 문자열 (예: '4/14')
         """
         sheet = self._get_admission_sheet()
-        existing = sheet.batch_get(['A:A', 'B:B'])
-        a_col = [r[0] if r else '' for r in existing[0]]
-        b_col = [r[0] if r else '' for r in existing[1]]
+        c_col = sheet.col_values(3)
 
         clean_name = name.replace(' ', '').strip()
         target_row = -1
-        for i, (a_val, b_val) in enumerate(zip(a_col, b_col)):
-            if (str(a_val).strip() == date_str and
-                    str(b_val).replace(' ', '').strip() == clean_name):
+        for i, val in enumerate(c_col):
+            if str(val).replace(' ', '').strip() == clean_name:
                 target_row = i + 1
                 break
 
         if target_row == -1:
             return False
 
-        # F=카톡, G=레벨, H=노트, I=첫수업일자, J=폼, K=전체시간표, L=시간표배정
-        # M(최종확인)은 자동 기입하지 않음
+        # F=안내문자, G=카톡, H=레벨, I=노트, J=첫수업, K=폼, L=시간표발송, M=시간표배정
         sheet.update(
-            f'F{target_row}:L{target_row}',
-            [[kakao, level_test, note, first_class,
+            f'F{target_row}:M{target_row}',
+            [[notice_msg, kakao, level_test, note, first_class,
               form_reg, timetable_send, schedule]],
             value_input_option='USER_ENTERED'
         )
@@ -270,6 +300,101 @@ class SheetManager:
         # O열 = 15번째 열 (A=1 기준)
         sheet.update_cell(target_row, 15, 'ㅇ')
         return True
+
+    def get_admission_checklist_by_names(self, names) -> dict[str, dict]:
+        """
+        입학식 관리 시트에서 C열 학생명을 대조해 각 학생의 체크리스트를 반환.
+        날짜 필터링 없음 — 이름이 일치하는 가장 마지막(아래쪽) 행 기준.
+
+        시트 열 매핑:
+          C=학생명, F=입학식안내문자, G=카톡, H=레벨, I=노트,
+          J=첫수업, K=폼, L=전체시간표, M=시간표배정
+
+        반환: {학생명(공백제거): {'notice':..., ...}}
+        """
+        sheet = self._get_admission_sheet()
+        all_rows = sheet.get_all_values()
+
+        wanted = {str(n).replace(' ', '').strip() for n in names if n}
+        result: dict[str, dict] = {}
+        for row in all_rows:
+            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
+            if not c_name or c_name not in wanted:
+                continue
+
+            def _g(i, r=row):
+                return r[i].strip() if i < len(r) else ''
+
+            # 같은 이름이 여러 행 있으면 마지막 행이 최종값이 되도록 덮어쓰기
+            result[c_name] = {
+                'notice':      _g(5),   # F
+                'kakao':       _g(6),   # G
+                'level':       _g(7),   # H
+                'note':        _g(8),   # I
+                'first_class': _g(9),   # J
+                'form':        _g(10),  # K
+                'tt_send':     _g(11),  # L
+                'schedule':    _g(12),  # M
+            }
+        return result
+
+    def get_admission_checklists(self, date_str: str) -> dict[str, dict]:
+        """[DEPRECATED] 날짜 기반 조회 — 호환용 shim. 새 코드는 by_names 사용."""
+        sheet = self._get_admission_sheet()
+        all_rows = sheet.get_all_values()
+        date_full, _ = self._date_full_and_dow(date_str)
+
+        result: dict[str, dict] = {}
+        for row in all_rows:
+            row_date = row[0].strip() if len(row) > 0 else ''
+            # 새 스키마(A="4/22 (수)") / 구 스키마(A="4/22") 모두 대응
+            if row_date != date_str and row_date != date_full:
+                continue
+            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
+            if not c_name:
+                continue
+
+            def _g(i, r=row):
+                return r[i].strip() if i < len(r) else ''
+            result[c_name] = {
+                'notice':      _g(5),
+                'kakao':       _g(6),
+                'level':       _g(7),
+                'note':        _g(8),
+                'first_class': _g(9),
+                'form':        _g(10),
+                'tt_send':     _g(11),
+                'schedule':    _g(12),
+            }
+        return result
+
+    def load_first_class_list(self) -> list[dict]:
+        """
+        '첫수업명단' 시트에서 학생 목록을 반환.
+        E열 = 학생명, R열 = 첫수업일.
+        반환: [{'name': ..., 'first_class': ...}, ...]  (헤더/빈 행 제외)
+        """
+        client = self._get_client()
+        spreadsheet_id = self.cfg.get('MAIN_SHEET', 'SPREADSHEET_ID')
+        sheet = client.open_by_key(spreadsheet_id).worksheet('첫수업명단')
+
+        batch = sheet.batch_get(['E:E', 'R:R'])
+        e_col = [row[0] if row else '' for row in batch[0]]
+        r_col = [row[0] if row else '' for row in batch[1]]
+
+        max_len = max(len(e_col), len(r_col))
+        result: list[dict] = []
+        for i in range(max_len):
+            name = (e_col[i] if i < len(e_col) else '').strip()
+            date = (r_col[i] if i < len(r_col) else '').strip()
+            if not name:
+                continue
+            # 헤더/구분선 필터
+            if ('학생명' in name or name in ('이름', '성명', '학생이름')
+                    or '---' in name):
+                continue
+            result.append({'name': name, 'first_class': date})
+        return result
 
     def get_sheet_direct(self):
         """업무 팝업 등 직접 sheet 객체가 필요한 경우 반환."""

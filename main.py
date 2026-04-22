@@ -42,6 +42,17 @@ def _get_base_path() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _read_local_version() -> str:
+    """version.json 에서 현재 버전 문자열 반환. 없으면 '?'."""
+    try:
+        base = _get_base_path()
+        vf = os.path.join(base, 'version.json')
+        with open(vf, encoding='utf-8') as f:
+            return json.load(f).get('version', '?')
+    except Exception:
+        return '?'
+
+
 def _is_running_from_temp(base_path: str) -> bool:
     """
     exe 가 Temp/AppData/Local/Temp 안에서 실행 중이면 True.
@@ -73,7 +84,7 @@ class AraonWorkstation(ctk.CTk):
                 '설치 경로 안내',
                 '⚠ 프로그램이 임시폴더(Temp)에서 실행 중입니다.\n\n'
                 'ZIP 파일을 압축해제한 뒤\n'
-                '압축 푼 폴더 안의 ARAON실행.exe 를 실행해주세요.\n\n'
+                '압축 푼 폴더 안의 launcher.exe 를 실행해주세요.\n\n'
                 '(탐색기에서 ZIP 을 더블클릭해서 바로 열면\n'
                 ' 이런 오류가 발생합니다.)'
             )
@@ -170,6 +181,23 @@ class AraonWorkstation(ctk.CTk):
             if hasattr(self, 'status_bar') and self.status_bar.winfo_exists():
                 self.status_bar.configure(text=f'  ● {msg}')
         self.after(0, _ui)
+
+    def _popup_to_front(self, title: str, msg: str, kind: str = 'info'):
+        """자동화 결과창을 한 번만 최상단으로 올린 뒤(맨위고정 X) 표시."""
+        try:
+            self.deiconify()
+            self.lift()
+            self.attributes('-topmost', True)
+            self.focus_force()
+            self.after(300, lambda: self.attributes('-topmost', False))
+        except Exception:
+            pass
+        if kind == 'error':
+            messagebox.showerror(title, msg)
+        elif kind == 'warning':
+            messagebox.showwarning(title, msg)
+        else:
+            messagebox.showinfo(title, msg)
 
     # ──────────────────────────────────────────
     #  LMS 캐시 관리
@@ -455,7 +483,15 @@ class AraonWorkstation(ctk.CTk):
     #  이미지 매칭 (카카오 매크로)
     # ──────────────────────────────────────────
     def find_img_any_scale(self, target_img_path, confidence=0.7, region=None):
+        """이미지 매칭. (x,y) 위치 반환, 실패 시 None.
+        self._last_match_score / self._last_match_reason 에 진단 정보 저장."""
+        self._last_match_score = 0.0
+        self._last_match_reason = ''
         try:
+            if not os.path.exists(target_img_path):
+                self._last_match_reason = 'file_missing'
+                return None
+
             if region:
                 x, y, w, h = region
                 screen = pyautogui.screenshot(region=(int(x), int(y), int(w), int(h)))
@@ -465,9 +501,12 @@ class AraonWorkstation(ctk.CTk):
             screen_bgr = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2BGR)
             template_bgr = cv2.imread(target_img_path, cv2.IMREAD_COLOR)
             if template_bgr is None:
+                self._last_match_reason = 'file_unreadable'
                 return None
 
-            for scale in [1.0, 1.1, 1.25, 1.5, 0.8, 0.9]:
+            best_val = 0.0
+            # 다양한 DPI/줌 대응: 원래 스케일 외에 작은 스케일도 포함
+            for scale in [1.0, 1.1, 1.25, 1.5, 0.9, 0.8, 0.7, 0.6, 0.5]:
                 if scale == 1.0:
                     tmpl = template_bgr
                 else:
@@ -479,6 +518,8 @@ class AraonWorkstation(ctk.CTk):
 
                 result = cv2.matchTemplate(screen_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                if max_val > best_val:
+                    best_val = max_val
 
                 if max_val >= confidence:
                     h_t, w_t = tmpl.shape[:2]
@@ -487,19 +528,232 @@ class AraonWorkstation(ctk.CTk):
                     if region:
                         mx += region[0]
                         my += region[1]
+                    self._last_match_score = float(max_val)
+                    self._last_match_reason = 'matched'
                     return (mx, my)
+
+            self._last_match_score = float(best_val)
+            self._last_match_reason = 'below_confidence'
             return None
         except Exception as e:
             self.write_system_log(f'이미지 매칭 오류: {e}')
+            self._last_match_reason = f'exception:{e}'
             return None
 
+    # ─────────────────────────────────────────────────────────────
+    #  카톡 좌표 캡처 마법사
+    # ─────────────────────────────────────────────────────────────
+    def _kakao_coord_summary(self) -> str:
+        def _g(k):
+            try:
+                return int(self.cfg.get('KAKAO_COORDS', k, '0'))
+            except Exception:
+                return 0
+        return (f'현재 저장된 좌표 (창 좌상단 기준):\n'
+                f'  · 전송:     ({_g("send_x")}, {_g("send_y")})\n'
+                f'  · 상담중:   ({_g("now_x")}, {_g("now_y")})\n'
+                f'  · 상담완료: ({_g("complete_x")}, {_g("complete_y")})\n'
+                f'  · 확인:     ({_g("ok_x")}, {_g("ok_y")})')
+
+    def _kakao_coord_capture_wizard(self, on_done=None):
+        """3단계 카운트다운 캡처 마법사. 활성 카톡창 좌상단 기준 오프셋을 저장."""
+        steps = [
+            ('전송 버튼',   'send_x',     'send_y'),
+            ('상담중 버튼', 'now_x',      'now_y'),
+            ('상담완료 버튼','complete_x','complete_y'),
+            ('확인 버튼',   'ok_x',       'ok_y'),
+        ]
+
+        wiz = ctk.CTkToplevel(self)
+        wiz.title('카톡 좌표 캡처')
+        wiz.geometry('420x260')
+        wiz.transient(self)
+        wiz.attributes('-topmost', True)
+        wiz.focus_force()
+
+        info = ctk.CTkLabel(
+            wiz,
+            text='① 카카오 상담창을 클릭해 활성화한 뒤\n'
+                 '② 안내된 버튼 위에 마우스를 올려두세요.\n'
+                 '③ 카운트다운이 끝나면 그 위치를 자동 캡처합니다.',
+            font=('Pretendard', 11), justify='left',
+        )
+        info.pack(pady=(14, 8), padx=14)
+
+        step_lbl = ctk.CTkLabel(wiz, text='', font=('Pretendard', 14, 'bold'),
+                                text_color='#fbbf24')
+        step_lbl.pack(pady=(2, 4))
+
+        count_lbl = ctk.CTkLabel(wiz, text='', font=('Pretendard', 22, 'bold'),
+                                 text_color='#10b981')
+        count_lbl.pack(pady=4)
+
+        result_lbl = ctk.CTkLabel(wiz, text='', font=('Pretendard', 10),
+                                  text_color='#9ca3af', justify='left')
+        result_lbl.pack(pady=4, padx=14)
+
+        state = {'idx': 0, 'cancel': False, 'captures': []}
+
+        def _finish():
+            if state['captures']:
+                for (label, kx, ky), (ox, oy) in zip(steps, state['captures']):
+                    self.cfg.set('KAKAO_COORDS', kx, str(ox))
+                    self.cfg.set('KAKAO_COORDS', ky, str(oy))
+                self.cfg.save()
+                self.write_system_log('카톡 좌표 캡처 저장 완료')
+            try:
+                if on_done:
+                    on_done()
+            except Exception:
+                pass
+            try:
+                wiz.destroy()
+            except Exception:
+                pass
+
+        def _start_step():
+            if state['cancel'] or state['idx'] >= len(steps):
+                _finish()
+                return
+            label, _, _ = steps[state['idx']]
+            step_lbl.configure(
+                text=f'{state["idx"]+1}/4 — [{label}] 위에 마우스를 두세요'
+            )
+            _countdown(5)
+
+        def _countdown(n):
+            if state['cancel']:
+                _finish()
+                return
+            if n <= 0:
+                _capture_now()
+                return
+            count_lbl.configure(text=f'{n}')
+            wiz.after(1000, lambda: _countdown(n - 1))
+
+        def _capture_now():
+            try:
+                mx, my = pyautogui.position()
+                win = gw.getActiveWindow()
+                if not win or win.width <= 0:
+                    result_lbl.configure(
+                        text='⚠ 활성창을 찾지 못했습니다. 카톡창을 클릭한 뒤 다시 시도하세요.',
+                        text_color='#ef4444',
+                    )
+                    state['cancel'] = True
+                    wiz.after(2200, _finish)
+                    return
+                ox = mx - win.left
+                oy = my - win.top
+                state['captures'].append((ox, oy))
+                label, _, _ = steps[state['idx']]
+                lines = [
+                    f'활성창: "{win.title}" ({win.width}x{win.height})',
+                ]
+                for i, (lab, _, _) in enumerate(steps[:len(state['captures'])]):
+                    cx, cy = state['captures'][i]
+                    lines.append(f'  ✓ {lab}: offset ({cx}, {cy})')
+                result_lbl.configure(text='\n'.join(lines), text_color='#9ca3af')
+                state['idx'] += 1
+                wiz.after(700, _start_step)
+            except Exception as e:
+                result_lbl.configure(text=f'캡처 오류: {e}', text_color='#ef4444')
+                state['cancel'] = True
+                wiz.after(2200, _finish)
+
+        ctk.CTkButton(wiz, text='취소', fg_color='#6b7280',
+                      command=lambda: (state.update(cancel=True), _finish())
+                      ).pack(side='bottom', pady=6)
+
+        wiz.after(800, _start_step)
+
     def run_kakao_macro(self):
+        """설정된 모드(coords/image) 에 따라 분기."""
+        mode = self.cfg.get('SETTINGS', 'kakao_macro_mode', 'coords').strip().lower()
+        if mode == 'image':
+            self._run_kakao_macro_image()
+        else:
+            self._run_kakao_macro_coords()
+
+    def _run_kakao_macro_coords(self):
+        """좌표 기반 카톡 매크로.
+        1~3번 버튼(전송/상담중/상담완료)은 활성 카톡창 좌상단 기준 고정 오프셋,
+        4번 버튼(확인)은 활성 카톡창의 가운데 좌표를 클릭한다."""
         if self._macro_running:
             self.write_system_log('카카오 매크로 이미 실행 중 — 중복 실행 방지')
             return
         self._macro_running = True
         try:
-            self.write_system_log('▶ 카카오 매크로 진입 (단축키 눌림)')
+            self.write_system_log('▶ 카카오 매크로 진입 [좌표 모드]')
+            og_x, og_y = pyautogui.position()
+
+            try:
+                win = gw.getActiveWindow()
+            except Exception as e:
+                self.write_system_log(f'에러: 활성창 조회 실패 — {e}')
+                return
+            if not win:
+                self.write_system_log('안내: 활성창이 없습니다. 카카오 상담창을 먼저 클릭해주세요.')
+                return
+            if win.width <= 0 or win.height <= 0:
+                self.write_system_log('에러: 활성창 크기 비정상')
+                return
+
+            self.write_system_log(
+                f'대상: "{win.title}" / 위치 ({win.left},{win.top}) / 크기 {win.width}x{win.height}'
+            )
+
+            def _ci(k: str) -> int:
+                try:
+                    return int(self.cfg.get('KAKAO_COORDS', k, '0'))
+                except Exception:
+                    return 0
+
+            sx, sy = _ci('send_x'),     _ci('send_y')
+            nx, ny = _ci('now_x'),      _ci('now_y')
+            cx, cy = _ci('complete_x'), _ci('complete_y')
+            ox, oy = _ci('ok_x'),       _ci('ok_y')
+
+            if not any([sx, sy, nx, ny, cx, cy, ox, oy]):
+                self.write_system_log(
+                    '⚠ 좌표가 설정되지 않았습니다. 환경설정 → "📍 카톡 좌표 캡처" 로 먼저 설정하세요.'
+                )
+                return
+
+            def _click_rel(label: str, ofx: int, ofy: int, wait: float = 0.35):
+                ax = win.left + ofx
+                ay = win.top + ofy
+                self.write_system_log(f'  · {label} 클릭 @ ({ax},{ay}) [offset {ofx},{ofy}]')
+                pyautogui.click(ax, ay)
+                time.sleep(wait)
+
+            # 1) 전송  (전송 → 상담중 사이는 1.1초 대기)
+            _click_rel('전송 버튼',   sx, sy, 1.1)
+            # 2) 상담중
+            _click_rel('상담중 버튼', nx, ny, 0.35)
+            # 3) 상담완료
+            _click_rel('상담완료 버튼', cx, cy, 0.5)
+            # 4) 확인
+            _click_rel('확인 버튼',   ox, oy, 0.4)
+
+            keyboard.press_and_release('ctrl+w')
+            pyautogui.moveTo(og_x, og_y)
+            self.write_system_log('카톡 상담 완료 (좌표 모드)')
+            self.increment_kakao_count()
+
+        except Exception as e:
+            self.write_system_log(f'카카오 매크로 에러(좌표): {e}')
+        finally:
+            self._macro_running = False
+
+    def _run_kakao_macro_image(self):
+        """기존 이미지 인식 기반 매크로 (fallback)."""
+        if self._macro_running:
+            self.write_system_log('카카오 매크로 이미 실행 중 — 중복 실행 방지')
+            return
+        self._macro_running = True
+        try:
+            self.write_system_log('▶ 카카오 매크로 진입 [이미지 모드]')
             og_x, og_y = pyautogui.position()
 
             # 활성 창 확인 (None 이면 바탕화면/트레이 등)
@@ -549,29 +803,54 @@ class AraonWorkstation(ctk.CTk):
                 )
                 return
             self.write_system_log(f'이미지 폴더: {img_dir}')
+            # 어떤 템플릿 PNG 가 실제로 존재하는지 먼저 체크
+            _required = ['send_msg_btn.png', 'consult_now_btn.png',
+                         'consult_complete_btn.png', 'consult_okay_btn.png']
+            _missing = [n for n in _required
+                        if not os.path.exists(os.path.join(img_dir, n))]
+            if _missing:
+                self.write_system_log(
+                    '⚠ 누락된 템플릿 PNG: ' + ', '.join(_missing) +
+                    '  → 해당 파일을 img 폴더에 넣어야 인식됩니다.'
+                )
+            else:
+                self.write_system_log('템플릿 PNG 4종 모두 존재 확인')
+
+            # 모든 카톡 버튼에 동일한 사용자 민감도 적용 (환경설정에서 조정)
+            _conf = self.cfg.get_kakao_confidence()
+            self.write_system_log(f'카톡 인식 민감도 = {_conf:.2f}')
+
+            def _diag(name: str) -> str:
+                reason = getattr(self, '_last_match_reason', '')
+                score  = getattr(self, '_last_match_score', 0.0)
+                if reason == 'file_missing':
+                    return f'{name}: 이미지 파일 자체가 없음 (img 폴더 확인 필요)'
+                if reason == 'file_unreadable':
+                    return f'{name}: 이미지 파일 읽기 실패 (깨졌거나 경로 한글 문제)'
+                return f'{name}: 매칭 실패 (최고 점수 {score:.2f} < 민감도 {_conf:.2f})'
 
             send_btn = os.path.join(img_dir, 'send_msg_btn.png')
-            loc = self.find_img_any_scale(send_btn, confidence=0.7, region=win_region)
+            loc = self.find_img_any_scale(send_btn, confidence=_conf, region=win_region)
             if loc:
                 pyautogui.click(loc)
                 time.sleep(0.3)
             else:
-                self.write_system_log('안내: send_msg_btn.png 없음')
+                self.write_system_log('안내: ' + _diag('send_msg_btn.png'))
 
             pyautogui.moveTo(10, 10)
 
             now_btn = os.path.join(img_dir, 'consult_now_btn.png')
             self.write_system_log('상담중 버튼 탐색 시작...')
-            loc = self.find_img_any_scale(now_btn, confidence=0.75, region=win_region)
+            loc = self.find_img_any_scale(now_btn, confidence=_conf, region=win_region)
             if not loc:
                 time.sleep(1.5)
-                loc = self.find_img_any_scale(now_btn, confidence=0.55, region=win_region)
+                loc = self.find_img_any_scale(now_btn, confidence=max(0.4, _conf - 0.05), region=win_region)
 
             if loc:
                 pyautogui.click(loc)
                 time.sleep(0.4)
             else:
-                self.write_system_log('안내: consult_now_btn.png 없음 — 다음 단계 진행')
+                self.write_system_log('안내: ' + _diag('consult_now_btn.png') + ' — 다음 단계 진행')
 
             pyautogui.moveTo(10, 10)
 
@@ -579,27 +858,34 @@ class AraonWorkstation(ctk.CTk):
             start = time.time()
             loc = None
             while time.time() - start < 2.5:
-                loc = self.find_img_any_scale(comp_btn, confidence=0.6, region=win_region)
+                loc = self.find_img_any_scale(comp_btn, confidence=_conf, region=win_region)
                 if loc:
                     break
                 time.sleep(0.1)
+            # 끝까지 못 찾으면 한 번 더 살짝 낮춰서 재시도
+            if not loc:
+                loc = self.find_img_any_scale(comp_btn, confidence=max(0.4, _conf - 0.1), region=win_region)
 
             if loc:
                 pyautogui.click(loc)
                 time.sleep(0.5)
             else:
-                self.write_system_log('에러: consult_complete_btn.png 찾기 실패')
+                self.write_system_log('에러: ' + _diag('consult_complete_btn.png'))
+                self.write_system_log(
+                    '  → 최고 점수가 민감도보다 조금 낮으면 슬라이더를 더 낮추세요. '
+                    '0.3 이하거나 파일 자체가 없으면 img 폴더/PNG 재캡처가 필요합니다.'
+                )
                 return
 
             pyautogui.moveTo(10, 10)
 
             ok_btn = os.path.join(img_dir, 'consult_okay_btn.png')
-            loc = self.find_img_any_scale(ok_btn, confidence=0.7, region=win_region)
+            loc = self.find_img_any_scale(ok_btn, confidence=_conf, region=win_region)
             if loc:
                 pyautogui.click(loc)
                 time.sleep(0.4)
             else:
-                self.write_system_log('에러: consult_okay_btn.png 찾기 실패')
+                self.write_system_log('에러: ' + _diag('consult_okay_btn.png'))
                 return
 
             keyboard.press_and_release('ctrl+w')
@@ -811,16 +1097,29 @@ class AraonWorkstation(ctk.CTk):
                                    corner_radius=0)
         nav_border.pack(side='top', fill='x')
 
-        # 브랜드 로고 (앱 이름)
-        brand_lbl = ctk.CTkLabel(
-            nav, text='ARAON', font=('Pretendard', 18, 'bold'),
-            text_color=C['brand'],
-        )
-        brand_lbl.pack(side='left', padx=(20, 4))
+        # 브랜드 로고 (앱 이름 + 버전)
+        brand_frame = ctk.CTkFrame(nav, fg_color='transparent')
+        brand_frame.pack(side='left', padx=(20, 12))
+
+        brand_top = ctk.CTkFrame(brand_frame, fg_color='transparent')
+        brand_top.pack(anchor='w')
         ctk.CTkLabel(
-            nav, text='Management', font=('Pretendard', 14),
+            brand_top, text='ARAON', font=('Pretendard', 18, 'bold'),
+            text_color=C['brand'],
+        ).pack(side='left')
+        ctk.CTkLabel(
+            brand_top, text='Management', font=('Pretendard', 14),
             text_color=C['text_dim'],
-        ).pack(side='left', padx=(0, 16))
+        ).pack(side='left', padx=(4, 0))
+
+        _ver_str = _read_local_version()
+        ver_lbl = ctk.CTkLabel(
+            brand_frame, text=f'v{_ver_str}',
+            font=('Pretendard', 10), text_color=C['text_dim'],
+            cursor='hand2',
+        )
+        ver_lbl.pack(anchor='w')
+        ver_lbl.bind('<Button-1>', lambda e: self._show_patch_notes())
 
         # 날짜 버튼
         self.date_btn = ctk.CTkButton(
@@ -1526,19 +1825,21 @@ class AraonWorkstation(ctk.CTk):
         return info
 
     def _fetch_and_show(self, ui_row_idx: int, name: str):
-        # ── 캐시 히트: 팝업 즉시 표시 + 백그라운드로 브라우저만 준비 ──
+        # ── 캐시 히트: 브라우저 먼저 준비 → 완료 후 팝업 표시 ──
+        # (브라우저보다 팝업이 먼저 뜨면 Chrome이 focus를 가져가 팝업이 가려지는 문제 방지)
         cached = self.lms_info_cache.get(name)
         if cached:
-            self.write_system_log(f'[{name}] 캐시 데이터 사용 (즉시 표시)')
-            self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, None, cached))
+            self.write_system_log(f'[{name}] 캐시 데이터 사용 (브라우저 준비 후 팝업 표시)')
 
             def _bg_open():
                 driver = self._create_lms_driver(name)
                 if driver:
                     self.work_drivers[ui_row_idx] = driver
-                    self.write_system_log(f'[{name}] 브라우저 백그라운드 준비 완료')
+                    self.write_system_log(f'[{name}] 브라우저 준비 완료. 팝업 표시...')
                 else:
-                    self.write_system_log(f'[{name}] 브라우저 백그라운드 준비 실패 (저장 불가)')
+                    self.write_system_log(f'[{name}] 브라우저 준비 실패 (캐시 데이터로 팝업 표시)')
+                self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, driver, cached))
+
             threading.Thread(target=_bg_open, daemon=True).start()
             return
 
@@ -1928,10 +2229,12 @@ class AraonWorkstation(ctk.CTk):
                         'id': '-', 'nm': '-', 'sch': '-', 'grd': '-',
                         'p_nm': '-', 'hp': '-', 'p_hp': '-', 'history': ''
                     }
-        # 입학식 관리 시트 기존 데이터 조회 (체크박스 초기값용, API 1회)
+        # 입학식 관리 시트에서 C열(학생명) 기준으로 기존 체크리스트 조회
+        # 같은 이름 있으면 프리체크, 없으면 이후 저장 시 새 행으로 추가됨
+        student_names = [s['name'] for s in students]
         try:
-            all_checklists = self.sheet_mgr.get_admission_checklists(
-                self.selected_date
+            all_checklists = self.sheet_mgr.get_admission_checklist_by_names(
+                student_names
             )
         except Exception as e:
             self.write_system_log(f'기존 체크리스트 일괄 조회 오류: {e}')
@@ -2261,11 +2564,11 @@ class AraonWorkstation(ctk.CTk):
                 except Exception as e:
                     self.write_system_log(f'[{name}] LMS 저장 오류: {e}')
 
-                # ── 3. 입학식 관리 시트 체크리스트 업데이트 ──
+                # ── 3. 입학식 관리 시트 체크리스트 업데이트 (C열 이름 매칭) ──
                 sheet_ok = False
                 try:
                     sheet_ok = self.sheet_mgr.update_admission_checklist(
-                        self.selected_date, name,
+                        name,
                         notice, kakao, level, note, fc, form, tt_send, sched
                     )
                     self.write_system_log(
@@ -2623,7 +2926,10 @@ class AraonWorkstation(ctk.CTk):
         tt_state = {
             'driver': None,                # LMS 드라이버 (lazy)
             'target': None,                # {'name','member_id','member_seq','grade'}
-            'existing_entries': [],        # 현재 LMS 에 배정된 엔트리
+            'existing_entries': [],        # 관리 대상 엔트리 (배정 시 자동 재배치)
+            'unmanaged_by_cell': {},       # (day,time) → entry dict, 관리 외 엔트리
+            'off_grid_entries': [],        # 그리드에 안 맞는 엔트리 (특강 등)
+            'pending_deletions': [],       # 사용자가 삭제표시한 비관리 엔트리
             'managed_subjects': [],        # 현재 학년 기준 관리 가능 과목
             'search_results': [],          # 검색 결과 목록
         }
@@ -2636,6 +2942,7 @@ class AraonWorkstation(ctk.CTk):
         chk_writing_var = ctk.BooleanVar(value=False)
 
         days = ['월', '화', '수', '목', '금']
+        ALL_DAYS = ['월', '화', '수', '목', '금', '토', '일']
         base_times = sorted({
             t
             for g in self.tt_data.get('subjects_by_grade', {}).values()
@@ -2692,9 +2999,14 @@ class AraonWorkstation(ctk.CTk):
         # 2. 학년 선택
         ctk.CTkLabel(content_panel, text='2. 학년 선택',
                      font=('Pretendard', 14, 'bold')).pack(anchor='w', pady=(4, 4))
+        # 학년 옵션: tt_data 기반 + 일반 학년 (LMS 가 보내는 값 모두 받기 위해)
+        _all_grades = list(self.tt_data.get('subjects_by_grade', {}).keys())
+        for _g in ['초3', '초4', '초5', '초6', '중1', '중2', '중3', '고1', '고2', '고3']:
+            if _g not in _all_grades:
+                _all_grades.append(_g)
         grade_menu = ctk.CTkOptionMenu(
             content_panel,
-            values=list(self.tt_data.get('subjects_by_grade', {}).keys()) or ['중1'],
+            values=_all_grades or ['중1'],
             variable=grade_var,
             width=180,
         )
@@ -2719,6 +3031,17 @@ class AraonWorkstation(ctk.CTk):
 
         table_wrap = ctk.CTkScrollableFrame(right_panel, fg_color='#1a1a1a')
         table_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+
+        # 그리드에 정말 배치 못 하는 잔여 엔트리만 표시 (예: 요일/시간 파싱 실패)
+        off_grid_wrap = ctk.CTkFrame(right_panel, fg_color='#1a1a1a')
+        off_grid_wrap.pack(fill='x', padx=10, pady=(0, 6))
+        off_grid_label = ctk.CTkLabel(off_grid_wrap,
+                                      text='📌 미배치 엔트리: 없음',
+                                      font=('Pretendard', 11, 'bold'),
+                                      text_color='#9ca3af')
+        off_grid_label.pack(anchor='w', padx=8, pady=(6, 2))
+        off_grid_row = ctk.CTkFrame(off_grid_wrap, fg_color='transparent')
+        off_grid_row.pack(fill='x', padx=8, pady=(0, 6))
 
         log_box = ctk.CTkTextbox(right_panel, height=140, fg_color='#0f172a',
                                  text_color='#e2e8f0')
@@ -2754,7 +3077,77 @@ class AraonWorkstation(ctk.CTk):
                     btn.configure(command=lambda d=day, t=ts: click_cell(d, t))
                     grid_cells[(day, ts)] = btn
 
+        def rebuild_grid():
+            """days/base_times 변경 시 그리드 재구성."""
+            for w in table_wrap.winfo_children():
+                w.destroy()
+            grid_cells.clear()
+            init_grid()
+
+        def ensure_grid_covers(entries):
+            """entries 의 (day,time) 을 모두 담도록 days/base_times 확장."""
+            entry_days = {e.get('day') for e in entries if e.get('day')}
+            entry_times = {e.get('time') for e in entries if e.get('time')}
+            desired_days = [d for d in ALL_DAYS if d in set(days) | entry_days]
+            desired_times = sorted(set(base_times) | {t for t in entry_times if t})
+            changed = False
+            if desired_days != days:
+                days[:] = desired_days
+                changed = True
+            if desired_times != base_times:
+                base_times[:] = desired_times
+                changed = True
+            if changed:
+                rebuild_grid()
+
+        def _entry_key(e_):
+            return (
+                (e_.get('subject') or '').strip(),
+                (e_.get('day') or '').strip(),
+                (e_.get('time') or '').strip(),
+            )
+
+        def is_pending_delete(entry):
+            ek = _entry_key(entry)
+            return any(_entry_key(x) == ek for x in tt_state.get('pending_deletions', []))
+
+        def toggle_pending_delete(entry):
+            ek = _entry_key(entry)
+            pend = tt_state.setdefault('pending_deletions', [])
+            for i, x in enumerate(pend):
+                if _entry_key(x) == ek:
+                    del pend[i]
+                    return
+            pend.append(dict(entry))
+
+        def render_off_grid():
+            for w in off_grid_row.winfo_children():
+                w.destroy()
+            off = tt_state.get('off_grid_entries', []) or []
+            if not off:
+                off_grid_label.configure(
+                    text='📌 미배치 엔트리: 없음',
+                    text_color='#9ca3af')
+                return
+            off_grid_label.configure(
+                text=f'📌 미배치 엔트리 — 클릭해 삭제표시 ({len(off)}건)',
+                text_color='#e5e7eb')
+            for ent in off:
+                pending = is_pending_delete(ent)
+                label = f"{ent.get('subject','')} | {ent.get('day','')} {ent.get('time','')}"
+                if pending:
+                    label = '🗑 ' + label
+                btn = ctk.CTkButton(
+                    off_grid_row, text=label, height=28,
+                    fg_color=('#991b1b' if pending else '#4b5563'),
+                    hover_color=('#7f1d1d' if pending else '#374151'),
+                    font=('Pretendard', 11),
+                    command=lambda e=ent: (toggle_pending_delete(e), render_off_grid()),
+                )
+                btn.pack(side='left', padx=3, pady=3)
+
         def update_timetable_view():
+            render_off_grid()
             current_matches.clear()
             grade = grade_var.get()
             subject_counts: dict = {}
@@ -2768,19 +3161,24 @@ class AraonWorkstation(ctk.CTk):
                     or self.tt_data.get('subjects_by_grade', {}).get(grade, {}).get(sub, {})
                 )
 
+            def _max_count(s: str) -> int:
+                # Grammar 은 주 1회, 그 외 과목은 주 2회
+                return 1 if (s or '').strip().lower().startswith('grammar') else 2
+
             for day in days:
                 for ts in base_times:
                     key = (day, ts)
                     matches = []
                     for sub in selected_subjects:
-                        if (subject_counts.get(sub, 0) >= 2 and
-                                final_selection.get(key) != sub):
+                        if (subject_counts.get(sub, 0) >= _max_count(sub)
+                                and final_selection.get(key) != sub):
                             continue
                         for dk, tl in sel_sub_data.get(sub, {}).items():
                             if day in dk and ts in tl:
                                 matches.append(sub)
                     current_matches[key] = matches
                     btn = grid_cells[key]
+                    unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)
                     if key in final_selection:
                         btn.configure(
                             text=final_selection[key], state='normal',
@@ -2791,6 +3189,19 @@ class AraonWorkstation(ctk.CTk):
                             text='\n'.join(matches), state='normal',
                             fg_color='#1f538d', hover_color='#1a4573',
                         )
+                    elif unmanaged:
+                        pending = is_pending_delete(unmanaged)
+                        subj = unmanaged.get('subject', '')
+                        if pending:
+                            btn.configure(
+                                text='🗑 ' + subj, state='normal',
+                                fg_color='#991b1b', hover_color='#7f1d1d',
+                            )
+                        else:
+                            btn.configure(
+                                text=subj, state='normal',
+                                fg_color='#4b5563', hover_color='#374151',
+                            )
                     else:
                         btn.configure(
                             text='', state='disabled',
@@ -2804,6 +3215,32 @@ class AraonWorkstation(ctk.CTk):
                 update_timetable_view()
                 return
             matches = current_matches.get(key, [])
+            unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)
+            if not matches and unmanaged:
+                # 같은 과목명 특강은 한 번에 토글 (예: 필기코칭방, 숙제방 등)
+                target_subj = (unmanaged.get('subject') or '').strip()
+                same_name = [
+                    e for e in tt_state.get('unmanaged_by_cell', {}).values()
+                    if (e.get('subject') or '').strip() == target_subj
+                ] + [
+                    e for e in tt_state.get('off_grid_entries', [])
+                    if (e.get('subject') or '').strip() == target_subj
+                ]
+                all_pending = all(is_pending_delete(e) for e in same_name)
+                pend = tt_state.setdefault('pending_deletions', [])
+                for e in same_name:
+                    ek = _entry_key(e)
+                    already = any(_entry_key(x) == ek for x in pend)
+                    if all_pending:
+                        # 복구
+                        for i, x in enumerate(pend):
+                            if _entry_key(x) == ek:
+                                del pend[i]
+                                break
+                    elif not already:
+                        pend.append(dict(e))
+                update_timetable_view()
+                return
             if not matches:
                 return
             if len(matches) == 1:
@@ -2982,8 +3419,7 @@ class AraonWorkstation(ctk.CTk):
             quick_grade = target.get('grade', '').strip()
             if quick_grade:
                 normalized = _normalize_grade(quick_grade)
-                grade_vals = list(self.tt_data.get('subjects_by_grade', {}).keys())
-                if normalized in grade_vals:
+                if normalized:
                     grade_var.set(normalized)
                     update_subject_list()
 
@@ -3015,6 +3451,9 @@ class AraonWorkstation(ctk.CTk):
                         return
 
                     tt_state['existing_entries'] = []
+                    tt_state['unmanaged_by_cell'] = {}
+                    tt_state['off_grid_entries'] = []
+                    tt_state['pending_deletions'] = []
                     grade_text = payload.get('grade', '') or target.get('grade', '')
                     if grade_text:
                         grade_var.set(_normalize_grade(grade_text))
@@ -3023,17 +3462,32 @@ class AraonWorkstation(ctk.CTk):
                     chk_weekly_var.set(bool(payload.get('weekly')))
                     chk_writing_var.set(bool(payload.get('writing')))
 
+                    # 모든 엔트리를 그리드에 담을 수 있도록 days/times 확장
+                    ensure_grid_covers(payload.get('entries', []))
+
                     keep_selection = {}
                     managed_entries = []
+                    unmanaged_by_cell = {}
+                    off_grid_entries = []
                     for e_ in payload.get('entries', []):
-                        if is_managed_subject(e_.get('subject', ''), managed):
+                        subj = e_.get('subject', '')
+                        day_ = e_.get('day', '')
+                        time_ = e_.get('time', '')
+                        if is_managed_subject(subj, managed):
                             managed_entries.append(e_)
-                        if (is_managed_subject(e_.get('subject', ''), managed)
-                                and e_.get('day') in days
-                                and e_.get('time') in base_times
-                                and e_.get('subject')):
-                            keep_selection[(e_['day'], e_['time'])] = e_['subject']
+                            if (day_ in days and time_ in base_times and subj):
+                                keep_selection[(day_, time_)] = subj
+                        else:
+                            # 관리 외 엔트리 (특강 포함) → 그리드 셀로 표시
+                            if not subj:
+                                continue
+                            if day_ in days and time_ in base_times:
+                                unmanaged_by_cell[(day_, time_)] = dict(e_)
+                            else:
+                                off_grid_entries.append(dict(e_))
                     tt_state['existing_entries'] = managed_entries
+                    tt_state['unmanaged_by_cell'] = unmanaged_by_cell
+                    tt_state['off_grid_entries'] = off_grid_entries
 
                     preselected = [
                         s for s in payload.get('subjects', [])
@@ -3058,13 +3512,14 @@ class AraonWorkstation(ctk.CTk):
             if not target:
                 write_log('먼저 학생을 검색·선택해주세요.')
                 return
-            if not final_selection:
+            pending_del = list(tt_state.get('pending_deletions') or [])
+            if not final_selection and not pending_del:
                 write_log('배정할 시간표 칸이 없습니다.')
                 return
             btn_assign.configure(state='disabled')
             write_log(f"[{target['name']}] 시간표 배정 시작")
 
-            existing = list(tt_state.get('existing_entries') or [])
+            existing = list(tt_state.get('existing_entries') or []) + pending_del
             managed = list(tt_state.get('managed_subjects') or [])
             selection = dict(final_selection)
             is_weekly = chk_weekly_var.get()
@@ -3102,6 +3557,21 @@ class AraonWorkstation(ctk.CTk):
                             {'subject': sub, 'day': d, 'time': t}
                             for (d, t), sub in selection.items()
                         ]
+                        # 삭제 처리된 비관리 엔트리는 목록에서 제거
+                        deleted_keys = {_entry_key(e) for e in pending_del}
+                        tt_state['unmanaged_by_cell'] = {
+                            k: v for k, v in tt_state.get('unmanaged_by_cell', {}).items()
+                            if _entry_key(v) not in deleted_keys
+                        }
+                        tt_state['off_grid_entries'] = [
+                            e for e in tt_state.get('off_grid_entries', [])
+                            if _entry_key(e) not in deleted_keys
+                        ]
+                        tt_state['pending_deletions'] = []
+                        try:
+                            update_timetable_view()
+                        except Exception:
+                            pass
                         write_log('배정 완료 → 시간표 조회 창을 엽니다.')
                         # 완료 후 시간표 보기 창 자동 실행
                         threading.Thread(
@@ -3307,20 +3777,31 @@ class AraonWorkstation(ctk.CTk):
                     const tdTexts = Array.from(tr.querySelectorAll('td'))
                                         .map(function(td) { return (td.innerText || td.textContent || '').trim(); });
                     let grade = '';
-                    for (var i = 0; i < tdTexts.length; i++) {
-                        var t = tdTexts[i];
-                        // "중1학년", "고2학년", "초4학년" 형태
-                        var m = t.match(/([초중고])(\d)학년/);
-                        if (m) { grade = m[1] + m[2]; break; }
-                        // "중1", "고2", "초4" 단독 셀
-                        var m2 = t.match(/^([초중고])\s*(\d)$/);
-                        if (m2) { grade = m2[1] + m2[2]; break; }
-                        // "M중3" 등 코드+학년 혼합
-                        var m3 = t.match(/[중고초](\d)/);
-                        if (m3 && t.length <= 6) {
-                            var prefix = t.match(/[초중고]/);
-                            if (prefix) { grade = prefix[0] + m3[1]; break; }
+                    // 1) "초등5", "중등2", "고등3" (괄호 포함 가능)
+                    const joined = tdTexts.join(' | ');
+                    var mEtc = joined.match(/([초중고])등\s*(\d)/);
+                    if (mEtc) { grade = mEtc[1] + mEtc[2]; }
+                    if (!grade) {
+                        for (var i = 0; i < tdTexts.length; i++) {
+                            var t = tdTexts[i];
+                            // "중1학년", "고2학년", "초4학년" 형태
+                            var m = t.match(/([초중고])(\d)학년/);
+                            if (m) { grade = m[1] + m[2]; break; }
+                            // "중1", "고2", "초4" 단독 셀
+                            var m2 = t.match(/^\(?([초중고])\s*(\d)\)?$/);
+                            if (m2) { grade = m2[1] + m2[2]; break; }
+                            // "M중3" 등 코드+학년 혼합
+                            var m3 = t.match(/[중고초](\d)/);
+                            if (m3 && t.length <= 8) {
+                                var prefix = t.match(/[초중고]/);
+                                if (prefix) { grade = prefix[0] + m3[1]; break; }
+                            }
                         }
+                    }
+                    // 2) 그래도 못 찾으면 전체 join 에서 "(초5)" / "중3" 등 탐색
+                    if (!grade) {
+                        var mAny = joined.match(/\(?\s*([초중고])\s*(\d)\s*(?:학년)?\s*\)?/);
+                        if (mAny) { grade = mAny[1] + mAny[2]; }
                     }
                     rows.push({href: href, name: name, grade: grade});
                 });
@@ -3586,7 +4067,7 @@ class AraonWorkstation(ctk.CTk):
                             (it.get('day') or '').strip(),
                             re.sub(r'[^0-9:]', '', (it.get('time') or '')),
                         )
-                        if (k in target_keys and _is_managed(subject_text)) or \
+                        if k in target_keys or \
                            any(lbl in subject_text for lbl in extra_delete_labels):
                             delete_targets.append(it)
 
@@ -3826,14 +4307,42 @@ class AraonWorkstation(ctk.CTk):
             messagebox.showinfo('알림', '첫수업명단 시트에 학생이 없습니다.')
             return
 
+        # 오늘 기준 2주 전 이후의 첫수업일 학생만 대상 (오래된 데이터 스킵)
+        import datetime
+        today = datetime.date.today()
+        cutoff = today - datetime.timedelta(days=14)
+
+        def _within_window(s: dict) -> bool:
+            parsed = self._parse_first_class_date(s.get('first_class', ''))
+            if not parsed:
+                return True  # 날짜 누락은 기존처럼 처리(뒤에서 스킵)
+            try:
+                y, mo, d = map(int, parsed.split('-'))
+                return datetime.date(y, mo, d) >= cutoff
+            except Exception:
+                return True
+
+        before_filter = len(students)
+        students = [s for s in students if _within_window(s)]
+        filtered_out = before_filter - len(students)
+        if not students:
+            messagebox.showinfo(
+                '알림',
+                f'2주 전({cutoff.isoformat()}) 이후 첫수업일 대상자가 없습니다.\n'
+                f'(전체 {before_filter}명 중 모두 제외)'
+            )
+            return
+
         total = len(students)
         no_date = sum(1 for s in students if not self._parse_first_class_date(s['first_class']))
         msg = (
             f'첫수업명단 {total}명의 출석체크를 저장하시겠습니까?\n\n'
             f'• 출석체크: Y\n'
-            f'• 시작일: R열 첫수업일\n'
+            f'• 시작일: R열 첫수업일 (오늘 기준 2주 전 이후만 대상)\n'
             f'• 종료일: GT-BASIC/GT-LINK/무료체험 +2개월,\n'
             f'         GT-PRO +6개월\n\n'
+            + (f'📅 기준일 {cutoff.isoformat()} 이전 첫수업일 {filtered_out}명 제외\n'
+               if filtered_out else '')
             + (f'⚠ 날짜 누락 {no_date}명은 자동 스킵됩니다.\n' if no_date else '')
             + '(대상 외 회원구분은 스킵)'
         )
@@ -3861,7 +4370,7 @@ class AraonWorkstation(ctk.CTk):
         try:
             total = len(students)
             self.write_system_log(f'출석체크 저장 시작 — 총 {total}명')
-            driver = SeleniumManager.create_incognito()
+            driver = SeleniumManager.create_incognito(background=True)
             SeleniumManager.lms_login(driver, lms_id, lms_pw)
             wait = WebDriverWait(driver, 10)
             short_wait = WebDriverWait(driver, 3)
@@ -4041,11 +4550,11 @@ class AraonWorkstation(ctk.CTk):
                 f'날짜없음 {skipped_nodate} / 결과없음 {skipped_nofound} / '
                 f'대상외 {skipped_nogb} / 오류 {errors}'
             )
-            self.after(0, lambda: messagebox.showinfo('완료', summary))
+            self.after(0, lambda: self._popup_to_front('완료', summary))
 
         except Exception as e:
             self.write_system_log(f'출석체크 저장 치명적 오류: {e}')
-            self.after(0, lambda: messagebox.showerror('오류', str(e)))
+            self.after(0, lambda: self._popup_to_front('오류', str(e), kind='error'))
         finally:
             SeleniumManager.safe_quit(driver)
             self._attend_check_running = False
@@ -4095,7 +4604,7 @@ class AraonWorkstation(ctk.CTk):
         driver = None
         try:
             self.write_system_log('일괄 강의방 등록 매크로 시작...')
-            driver = SeleniumManager.create_incognito()
+            driver = SeleniumManager.create_incognito(background=True)
             wait = SeleniumManager.lms_login(driver, lms_id, lms_pw)
             short_wait = WebDriverWait(driver, 3)
 
@@ -4230,7 +4739,7 @@ class AraonWorkstation(ctk.CTk):
             driver.switch_to.window(main_window)
             self.write_system_log(f'입학식 일괄 등록 완료! (성공: {success_count}명)')
             self.after(
-                0, lambda: messagebox.showinfo(
+                0, lambda: self._popup_to_front(
                     '완료', f'입학식 일괄 등록 완료\n(성공: {success_count}건)'
                 )
             )
@@ -4262,7 +4771,7 @@ class AraonWorkstation(ctk.CTk):
         success = 0
         skipped = 0
         try:
-            driver = SeleniumManager.create_incognito()
+            driver = SeleniumManager.create_incognito(background=True)
             SeleniumManager.lms_login(driver, lms_id, lms_pw)
             wait = WebDriverWait(driver, 10)
 
@@ -4356,6 +4865,68 @@ class AraonWorkstation(ctk.CTk):
 
         ctk.CTkButton(win, text='데이터 불러오기', command=sel).pack(pady=10)
 
+    def _show_patch_notes(self):
+        """GitHub 최신 릴리즈 패치노트를 팝업으로 표시."""
+        import tkinter as tk
+        from tkinter import ttk
+
+        pop = ctk.CTkToplevel(self)
+        pop.title('패치노트')
+        pop.geometry('500x420')
+        pop.resizable(True, True)
+        pop.transient(self)
+        pop.focus_force()
+
+        ctk.CTkLabel(
+            pop, text=f'패치노트 불러오는 중...',
+            font=('Pretendard', 12),
+        ).pack(expand=True)
+
+        def _fetch():
+            try:
+                repo = self.cfg.get('UPDATE', 'repo', '').strip()
+                token = self.cfg.get('UPDATE', 'token', '').strip()
+                if not repo:
+                    raise ValueError('repo 미설정')
+                from araon_core import updater as upd
+                url = f'https://api.github.com/repos/{repo}/releases/latest'
+                data = upd._api_get(url, token)
+                ver = data.get('tag_name', '').lstrip('v')
+                notes = (data.get('body') or '패치노트 없음').strip()
+                pop.after(0, lambda: _show(ver, notes))
+            except Exception as e:
+                pop.after(0, lambda: _show('?', f'불러오기 실패: {e}'))
+
+        def _show(ver, notes):
+            for w in pop.winfo_children():
+                w.destroy()
+            ctk.CTkLabel(
+                pop, text=f'v{ver} 패치노트',
+                font=('Pretendard', 14, 'bold'),
+            ).pack(pady=(16, 6))
+
+            txt_frame = ctk.CTkFrame(pop, fg_color='#1e293b', corner_radius=8)
+            txt_frame.pack(fill='both', expand=True, padx=16, pady=(0, 16))
+
+            scrollbar = tk.Scrollbar(txt_frame)
+            scrollbar.pack(side='right', fill='y')
+
+            txt = tk.Text(
+                txt_frame,
+                bg='#1e293b', fg='#cbd5e1',
+                font=('맑은 고딕', 9),
+                wrap='word', relief='flat', bd=0,
+                padx=10, pady=8,
+                yscrollcommand=scrollbar.set,
+                cursor='arrow',
+            )
+            txt.insert('1.0', notes)
+            txt.config(state='disabled')
+            txt.pack(side='left', fill='both', expand=True)
+            scrollbar.config(command=txt.yview)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
     def open_settings_menu(self):
         pop = ctk.CTkToplevel(self)
         pop.title('환경 설정')
@@ -4365,7 +4936,7 @@ class AraonWorkstation(ctk.CTk):
 
         for label, cmd in [
             ('📝 AS 상용구 편집', self.popup_as_templates),
-            ('⌨ 단축키 및 테마 설정', self.popup_hotkey_theme),
+            ('⌨ 카카오톡 및 테마 설정', self.popup_hotkey_theme),
             ('📋 퀵카피 텍스트 편집', self.popup_copy_edit),
             ('🔑 LMS 계정 설정', self.popup_accounts),
             ('🎓 수업방 URL 설정', self.popup_class_room),
@@ -4404,8 +4975,8 @@ class AraonWorkstation(ctk.CTk):
 
     def popup_hotkey_theme(self):
         pop = ctk.CTkToplevel(self)
-        pop.title('단축키 및 테마')
-        pop.geometry('380x400')
+        pop.title('카카오톡 및 테마')
+        pop.geometry('420x640')
         pop.transient(self)
         pop.focus_force()
 
@@ -4420,13 +4991,55 @@ class AraonWorkstation(ctk.CTk):
         sld.set(kw)
         sld.pack(padx=20, fill='x')
 
+        # ── 카톡 매크로 모드 + 좌표 캡처 ───────────────────────
+        ctk.CTkLabel(pop, text='─── 카톡 매크로 ───',
+                     font=('Pretendard', 11, 'bold'),
+                     text_color='#94a3b8').pack(pady=(14, 4))
+
+        mode_var = ctk.StringVar(
+            value=self.cfg.get('SETTINGS', 'kakao_macro_mode', 'coords')
+        )
+        mode_row = ctk.CTkFrame(pop, fg_color='transparent')
+        mode_row.pack()
+        ctk.CTkRadioButton(mode_row, text='좌표 모드(권장)', variable=mode_var,
+                           value='coords').pack(side='left', padx=8)
+        ctk.CTkRadioButton(mode_row, text='이미지 모드', variable=mode_var,
+                           value='image').pack(side='left', padx=8)
+
+        coord_lbl = ctk.CTkLabel(
+            pop, text=self._kakao_coord_summary(),
+            font=('Pretendard', 10), text_color='#9ca3af',
+            justify='left'
+        )
+        coord_lbl.pack(pady=(6, 2))
+
+        def _capture():
+            self._kakao_coord_capture_wizard(on_done=lambda: coord_lbl.configure(
+                text=self._kakao_coord_summary()))
+
+        ctk.CTkButton(pop, text='📍 카톡 좌표 캡처 (4단계)',
+                      fg_color='#0ea5e9', hover_color='#0284c7',
+                      command=_capture).pack(pady=4)
+
+        # 이미지 모드용 민감도 슬라이더 (이미지 모드일 때만 의미 있음)
+        conf_lbl = ctk.CTkLabel(pop, text=f'(이미지 모드) 민감도: {self.cfg.get_kakao_confidence():.2f}')
+        conf_lbl.pack(pady=(10, 2))
+        conf_sld = ctk.CTkSlider(pop, from_=0.4, to=0.9, number_of_steps=10)
+        conf_sld.set(self.cfg.get_kakao_confidence())
+        conf_sld.pack(padx=20, fill='x')
+
+        def _on_conf(val):
+            conf_lbl.configure(text=f'(이미지 모드) 민감도: {float(val):.2f}')
+
+        conf_sld.configure(command=_on_conf)
+
         topmost_var = ctk.BooleanVar(
             value=self.cfg.getboolean('SETTINGS', 'popup_topmost', True)
         )
         ctk.CTkSwitch(
             pop, text='업무 팝업 항상 위에',
             font=('Pretendard', 12, 'bold'), variable=topmost_var
-        ).pack(pady=(20, 5))
+        ).pack(pady=(16, 5))
 
         def toggle_theme():
             new = 'light' if ctk.get_appearance_mode() == 'Dark' else 'dark'
@@ -4441,6 +5054,8 @@ class AraonWorkstation(ctk.CTk):
         def save():
             self.cfg.set('SETTINGS', 'hotkey', e.get())
             self.cfg.set('SETTINGS', 'k_column_width', str(int(sld.get())))
+            self.cfg.set('SETTINGS', 'kakao_confidence', f'{conf_sld.get():.2f}')
+            self.cfg.set('SETTINGS', 'kakao_macro_mode', mode_var.get())
             self.cfg.set('SETTINGS', 'popup_topmost', str(topmost_var.get()))
             self.cfg.save()
             keyboard.unhook_all()
