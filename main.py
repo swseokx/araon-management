@@ -22,7 +22,7 @@ import numpy as np
 from tkinter import messagebox, Listbox
 from tkcalendar import Calendar
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote, quote_plus
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -2001,20 +2001,23 @@ class AraonWorkstation(ctk.CTk):
         return info
 
     def _fetch_and_show(self, ui_row_idx: int, name: str):
-        # ── 캐시 히트: 브라우저 먼저 준비 → 완료 후 팝업 표시 ──
-        # (브라우저보다 팝업이 먼저 뜨면 Chrome이 focus를 가져가 팝업이 가려지는 문제 방지)
         cached = self.lms_info_cache.get(name)
         if cached:
-            self.write_system_log(f'[{name}] 캐시 데이터 사용 (브라우저 준비 후 팝업 표시)')
+            # ── 캐시 히트: 팝업 즉시 표시 → 브라우저는 백그라운드 준비 후 최소화 ──
+            self.write_system_log(f'[{name}] 캐시 사용. 팝업 먼저 표시 후 브라우저 준비 시작')
+            self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, None, cached))
 
             def _bg_open():
                 driver = self._create_lms_driver(name)
                 if driver:
+                    try:
+                        driver.minimize_window()   # 팝업 위로 안 올라오게
+                    except Exception:
+                        pass
                     self.work_drivers[ui_row_idx] = driver
-                    self.write_system_log(f'[{name}] 브라우저 준비 완료. 팝업 표시...')
+                    self.write_system_log(f'[{name}] 브라우저 준비 완료 (최소화 상태)')
                 else:
-                    self.write_system_log(f'[{name}] 브라우저 준비 실패 (캐시 데이터로 팝업 표시)')
-                self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, driver, cached))
+                    self.write_system_log(f'[{name}] 브라우저 준비 실패')
 
             threading.Thread(target=_bg_open, daemon=True).start()
             return
@@ -2038,7 +2041,9 @@ class AraonWorkstation(ctk.CTk):
         self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, driver, info))
 
     def _build_work_popup_ui(self, ui_row_idx, name, driver, info):
-        self.work_drivers[ui_row_idx] = driver
+        # driver=None 이면 캐시 히트 경로 — _bg_open 스레드가 나중에 등록
+        if driver is not None:
+            self.work_drivers[ui_row_idx] = driver
 
         pop = ctk.CTkToplevel(self)
         pop.title(f'업무 처리 - {name}')
@@ -2097,6 +2102,7 @@ class AraonWorkstation(ctk.CTk):
         row2 = ctk.CTkFrame(info_f, fg_color='transparent')
         row2.pack(fill='x', padx=15, pady=(5, 15))
 
+        # current_data_cache 컬럼 인덱스: 9=M(개통완료), 10=N(연락수단)
         n_col_val = ''
         if (len(self.current_data_cache) > ui_row_idx and
                 len(self.current_data_cache[ui_row_idx]) > 10):
@@ -2124,116 +2130,85 @@ class AraonWorkstation(ctk.CTk):
                 text_color=C.get('warning', '#0145F2')
             ).pack(side='left', padx=15)
 
-        main_f = ctk.CTkFrame(pop, fg_color='transparent')
-        main_f.pack(fill='both', expand=True, padx=20, pady=10)
+        # ══════════════════════════════════════════════════════
+        #  body: 왼쪽 콘텐츠 + (AS완료 시) 오른쪽 상용구 패널
+        # ══════════════════════════════════════════════════════
+        body = ctk.CTkFrame(pop, fg_color='transparent')
+        body.pack(fill='both', expand=True, padx=20, pady=(0, 10))
 
-        left_f = ctk.CTkFrame(
-            main_f,
-            fg_color=C.get('surface', '#FFFFFF'),
-            corner_radius=14,
-            border_width=1,
-            border_color=C.get('border', '#D6DEE8'),
-        )
-        left_f.pack(side='left', fill='both', expand=True, padx=(0, 10))
+        # ── AS 상용구 패널 (body 오른쪽, 조건부 표시) ──────────
+        # Listbox 는 표준 tkinter → (light,dark) 튜플 불가 → 단일 색 추출 헬퍼
+        _di = 1 if ctk.get_appearance_mode().lower() == 'dark' else 0
 
-        ctk.CTkLabel(
-            left_f, text='[ 기존 특이사항 / 상담 이력 ]',
-            font=('Pretendard', 13, 'bold')
-        ).pack(anchor='w', pady=(10, 5), padx=10)
-        history_box = self._style_textbox(
-            ctk.CTkTextbox(left_f, height=150, font=('Pretendard', 12))
-        )
-        history_box.pack(fill='x', padx=10, pady=(0, 10))
-        history_box.insert('1.0', info['history'])
-        history_box.configure(state='disabled')
+        def _c(key, fallback='#000000'):
+            v = C.get(key, fallback)
+            return v[_di] if isinstance(v, (list, tuple)) else v
 
-        ctk.CTkLabel(
-            left_f, text='[ 새 상담 내용 ]',
-            font=('Pretendard', 13, 'bold')
-        ).pack(anchor='w', pady=(10, 5), padx=10)
-        t_var = ctk.StringVar(value='개통')
-        rb_f = ctk.CTkFrame(left_f, fg_color='transparent')
-        rb_f.pack(anchor='w', padx=10)
-
-        # ── 퀵카피 (항상 오른쪽) ──
-        quick_copy_f = ctk.CTkFrame(
-            main_f,
-            fg_color=C.get('surface', '#FFFFFF'),
-            corner_radius=14,
-            border_width=1,
-            border_color=C.get('border', '#D6DEE8'),
-        )
-        quick_copy_f.pack(side='right', fill='y', padx=(10, 0))
-        ctk.CTkLabel(
-            quick_copy_f, text='📋 퀵카피',
-            font=('Pretendard', 12, 'bold')
-        ).pack(pady=10)
-        qc_scroll = ctk.CTkScrollableFrame(
-            quick_copy_f,
-            fg_color=C.get('surface_hi', '#F6F8FB'),
-            width=200,
-        )
-        qc_scroll.pack(fill='both', expand=True, padx=5, pady=(0, 10))
-        for i in range(1, 16):
-            t = self.cfg.get('COPY_BUTTONS', f'btn_{i}_title', f'업무 {i}')
-            c = self.cfg.get('COPY_BUTTONS', f'btn_{i}_text', '')
-            if t or c:
-                ctk.CTkButton(
-                    qc_scroll, text=t, height=32,
-                    fg_color='transparent',
-                    hover_color=C.get('surface_lo', '#E1E8F0'),
-                    text_color=C.get('text', '#18212F'),
-                    anchor='w',
-                    command=lambda txt=c: [
-                        pyperclip.copy(txt),
-                        self.write_system_log('퀵카피 복사됨')
-                    ]
-                ).pack(fill='x', pady=3)
-
-        # ── AS 상용구 패널 (quick_copy_f 왼쪽, AS선택시만 표시) ──
-        # side='right'로 나중에 pack하면 quick_copy_f 왼쪽에 붙음
         as_f = ctk.CTkFrame(
-            main_f,
+            body,
             fg_color=C.get('surface', '#FFFFFF'),
             corner_radius=14,
             border_width=1,
             border_color=C.get('border', '#D6DEE8'),
         )
-        ctk.CTkLabel(
-            as_f, text='AS 상용구\n(더블클릭)',
-            font=('Pretendard', 12, 'bold')
-        ).pack(pady=10)
+        ctk.CTkLabel(as_f, text='AS 상용구\n(더블클릭)',
+                     font=('Pretendard', 12, 'bold')).pack(pady=10)
         as_list = Listbox(
-            as_f, bg=C.get('surface_hi', '#F6F8FB'), fg=C.get('text', '#18212F'),
-            font=('Pretendard', 11), borderwidth=0,
-            highlightthickness=0,
-            selectbackground=C.get('brand', '#0145F2'),
-            selectforeground=C.get('text_on_brand', '#FFFFFF')
+            as_f,
+            bg=_c('surface_hi', '#F6F8FB'),
+            fg=_c('text', '#18212F'),
+            font=('Pretendard', 11), borderwidth=0, highlightthickness=0,
+            selectbackground=_c('brand', '#0145F2'),
+            selectforeground='#FFFFFF',
         )
         as_list.pack(fill='both', expand=True, padx=10, pady=(0, 10))
         for tmpl in self.cfg.get('AS_TEMPLATES', 'list', '').split(','):
             if tmpl.strip():
                 as_list.insert('end', tmpl.strip())
 
+        # ── 왼쪽 메인 패널 ─────────────────────────────────────
+        left_f = ctk.CTkFrame(
+            body,
+            fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14,
+            border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
+        left_f.pack(side='left', fill='both', expand=True)
+
+        # 기존 이력
+        ctk.CTkLabel(left_f, text='[ 기존 특이사항 / 상담 이력 ]',
+                     font=('Pretendard', 13, 'bold')
+                     ).pack(anchor='w', pady=(10, 4), padx=10)
+        history_box = self._style_textbox(
+            ctk.CTkTextbox(left_f, height=140, font=('Pretendard', 12))
+        )
+        history_box.pack(fill='x', padx=10, pady=(0, 8))
+        history_box.insert('1.0', info['history'])
+        history_box.configure(state='disabled')
+
+        # 구분선
+        ctk.CTkFrame(left_f, height=1,
+                     fg_color=C.get('border', '#D6DEE8')).pack(fill='x', padx=10)
+
+        # ── 라디오버튼 4개 ──
+        t_var = ctk.StringVar(value='개통완료')
+
         def on_radio_change():
-            if t_var.get() == 'AS':
+            if t_var.get() == 'AS완료':
                 as_f.pack(side='right', fill='y', padx=(10, 0))
             else:
                 as_f.pack_forget()
 
-        ctk.CTkRadioButton(
-            rb_f, text='개통완료', variable=t_var,
-            value='개통', command=on_radio_change
-        ).pack(side='left', padx=(0, 10))
-        ctk.CTkRadioButton(
-            rb_f, text='AS완료', variable=t_var,
-            value='AS', command=on_radio_change
-        ).pack(side='left', padx=10)
+        rb_f = ctk.CTkFrame(left_f, fg_color='transparent')
+        rb_f.pack(fill='x', padx=10, pady=(10, 6))
+        for val in ('개통완료', 'AS완료', '개통실패', 'AS실패'):
+            ctk.CTkRadioButton(
+                rb_f, text=val, variable=t_var, value=val,
+                command=on_radio_change,
+            ).pack(side='left', padx=(0, 14))
 
-        # ── left_f 하단 저장버튼 영역 ──
-        # left_bottom 은 save_btn 추가 후 pack 해야 height 가 0 이 아님
-        left_bottom = ctk.CTkFrame(left_f, fg_color='transparent')
-
+        # ── 저장 버튼 (side='bottom' 먼저 → memo expand 에 안 밀림) ──
         def save_lms():
             save_btn.configure(state='disabled', text='저장 중...')
 
@@ -2266,11 +2241,11 @@ class AraonWorkstation(ctk.CTk):
                         return
 
                     memo_raw = memo.get('1.0', 'end').strip()
-                    category = t_var.get()
+                    category = t_var.get()  # 개통완료/AS완료/개통실패/AS실패
                     final_text = (
                         f'[{category}] {name} '
                         f"{datetime.now().strftime('%m/%d %H:%M')}"
-                        f'[{category}]완료\n: {memo_raw}'
+                        f'\n: {memo_raw}'
                     )
 
                     wait = WebDriverWait(target_driver, 10)
@@ -2355,17 +2330,17 @@ class AraonWorkstation(ctk.CTk):
 
             threading.Thread(target=bg_task, daemon=True).start()
 
-        # ── save_btn 을 left_bottom 에 추가한 뒤 left_bottom 을 pack ──
-        # (left_bottom 이 빈 채로 pack 되면 height=0 → memo expand 에 밀림)
+        # save_btn 을 side='bottom' 으로 먼저 pack → memo expand 에 안 밀림
         save_btn = self._make_button(
-            left_bottom, text='LMS 저장 및 완료', variant='primary', height=50,
-            font=('Pretendard', 15, 'bold'), command=save_lms
+            left_f, text='LMS 저장 및 완료', variant='primary', height=50,
+            font=('Pretendard', 15, 'bold'), command=save_lms,
         )
-        save_btn.pack(fill='x')
-        left_bottom.pack(side='bottom', fill='x', padx=10, pady=(6, 12))
+        save_btn.pack(side='bottom', fill='x', padx=10, pady=(6, 12))
 
-        # ── memo: left_bottom pack 이후 남은 공간 채우기 ──
-        memo = self._style_textbox(ctk.CTkTextbox(left_f, height=200, font=('Pretendard', 13)))
+        # memo 는 save_btn 이후 남은 공간 채움
+        memo = self._style_textbox(
+            ctk.CTkTextbox(left_f, height=200, font=('Pretendard', 13))
+        )
         memo.pack(fill='both', expand=True, padx=10, pady=(6, 4))
 
         def add_text(event):
@@ -2428,40 +2403,6 @@ class AraonWorkstation(ctk.CTk):
         profile_dir = os.path.join(root, 'ARAONManagement', 'chrome-ezview-profile')
         os.makedirs(profile_dir, exist_ok=True)
         return profile_dir
-
-    def _get_class_room_url(self) -> str:
-        return (
-            self.cfg.get('LMS', 'class_room_url', '').strip()
-            or self.cfg.get('LMS', 'admission_room_url', '').strip()
-        )
-
-    def _get_class_room_list_url(self) -> str:
-        room_url = self._get_class_room_url()
-        if not room_url:
-            return ''
-
-        try:
-            parsed = urlparse(room_url)
-            query = parse_qs(parsed.query)
-            class_cd = (query.get('class_cd') or [''])[0].strip()
-            year = (query.get('year') or [''])[0].strip()
-            if not class_cd:
-                return room_url
-
-            new_query = {'class_cd': class_cd}
-            if year:
-                new_query['year'] = year
-
-            return urlunparse((
-                parsed.scheme,
-                parsed.netloc,
-                '/wcms/onAirClass/onAirClassList.asp',
-                '',
-                urlencode(new_query),
-                '',
-            ))
-        except Exception:
-            return room_url
 
     def _launch_ezview_bg(self):
         """OT 팝업용: 입학식방 강사 버튼 클릭 → 권한창 Tab-Tab-Enter → ezviewX 실행."""
@@ -3410,9 +3351,6 @@ class AraonWorkstation(ctk.CTk):
     #    - 배정 후 자동으로 시간표 조회 창을 띄운다
     # ──────────────────────────────────────────
     def open_timetable_popup(self):
-        import json
-        from urllib.parse import quote_plus
-
         tt_path = os.path.join(self.base_path, 'timetable_data.json')
         # PyInstaller onefile 번들 경로(_MEIPASS)도 fallback 으로 시도
         if not os.path.exists(tt_path) and hasattr(sys, '_MEIPASS'):
@@ -3447,7 +3385,7 @@ class AraonWorkstation(ctk.CTk):
             'driver': None,                # LMS 드라이버 (lazy)
             'target': None,                # {'name','member_id','member_seq','grade'}
             'existing_entries': [],        # 관리 대상 엔트리 (배정 시 자동 재배치)
-            'unmanaged_by_cell': {},       # (day,time) → entry dict, 관리 외 엔트리
+            'unmanaged_by_cell': {},       # (day,time) → list[entry dict], 관리 외 엔트리
             'off_grid_entries': [],        # 그리드에 안 맞는 엔트리 (특강 등)
             'pending_deletions': [],       # 사용자가 삭제표시한 비관리 엔트리
             'managed_subjects': [],        # 현재 학년 기준 관리 가능 과목
@@ -3650,17 +3588,26 @@ class AraonWorkstation(ctk.CTk):
                 (e_.get('subject') or '').strip(),
                 (e_.get('day') or '').strip(),
                 (e_.get('time') or '').strip(),
+                (e_.get('checkbox_value') or '').strip(),
             )
 
         def is_pending_delete(entry):
+            if not isinstance(entry, dict):
+                return False
             ek = _entry_key(entry)
-            return any(_entry_key(x) == ek for x in tt_state.get('pending_deletions', []))
+            return any(
+                _entry_key(x) == ek
+                for x in tt_state.get('pending_deletions', [])
+                if isinstance(x, dict)
+            )
 
         def toggle_pending_delete(entry):
+            if not isinstance(entry, dict):
+                return
             ek = _entry_key(entry)
             pend = tt_state.setdefault('pending_deletions', [])
             for i, x in enumerate(pend):
-                if _entry_key(x) == ek:
+                if isinstance(x, dict) and _entry_key(x) == ek:
                     del pend[i]
                     return
             pend.append(dict(entry))
@@ -3724,6 +3671,11 @@ class AraonWorkstation(ctk.CTk):
                     current_matches[key] = matches
                     btn = grid_cells[key]
                     unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)
+                    # 구버전 dict 형식 → 리스트로 정규화
+                    if isinstance(unmanaged, dict):
+                        unmanaged = [unmanaged]
+                    elif unmanaged is not None and not isinstance(unmanaged, list):
+                        unmanaged = None
                     if key in final_selection:
                         # 선택됨 → 진파랑
                         btn.configure(
@@ -3741,18 +3693,28 @@ class AraonWorkstation(ctk.CTk):
                             text_color='#1E3A8A',
                         )
                     elif unmanaged:
-                        pending = is_pending_delete(unmanaged)
-                        subj = unmanaged.get('subject', '')
-                        if pending:
+                        # unmanaged 는 이제 list[dict]
+                        n_del = sum(1 for e in unmanaged if is_pending_delete(e))
+                        n_tot = len(unmanaged)
+                        subj = unmanaged[0].get('subject', '') if unmanaged else ''
+                        label = subj if n_tot == 1 else f'{subj} (×{n_tot})'
+                        if n_del == n_tot:          # 전체 삭제 표시
                             btn.configure(
-                                text='🗑 ' + subj, state='normal',
+                                text='🗑 ' + label, state='normal',
                                 fg_color=C.get('danger', '#D14343'),
                                 hover_color=C.get('danger_hv', '#B73636'),
                                 text_color=C.get('text_on_brand', '#FFFFFF'),
                             )
+                        elif n_del > 0:             # 일부만 삭제 표시
+                            btn.configure(
+                                text=f'🗑({n_del}/{n_tot}) ' + subj, state='normal',
+                                fg_color='#F97316',
+                                hover_color='#EA6700',
+                                text_color='#FFFFFF',
+                            )
                         else:
                             btn.configure(
-                                text=subj, state='normal',
+                                text=label, state='normal',
                                 fg_color=C.get('secondary', '#76839A'),
                                 hover_color=C.get('secondary_hv', '#5E6A80'),
                                 text_color=C.get('text_on_secondary', '#FFFFFF'),
@@ -3772,31 +3734,74 @@ class AraonWorkstation(ctk.CTk):
                 update_timetable_view()
                 return
             matches = current_matches.get(key, [])
-            unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)
+            unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)  # list[dict]
+            if isinstance(unmanaged, dict):
+                unmanaged = [unmanaged]
+            elif unmanaged is not None and not isinstance(unmanaged, list):
+                unmanaged = None
             if not matches and unmanaged:
-                # 같은 과목명 특강은 한 번에 토글 (예: 필기코칭방, 숙제방 등)
-                target_subj = (unmanaged.get('subject') or '').strip()
-                same_name = [
-                    e for e in tt_state.get('unmanaged_by_cell', {}).values()
-                    if (e.get('subject') or '').strip() == target_subj
-                ] + [
-                    e for e in tt_state.get('off_grid_entries', [])
-                    if (e.get('subject') or '').strip() == target_subj
-                ]
-                all_pending = all(is_pending_delete(e) for e in same_name)
-                pend = tt_state.setdefault('pending_deletions', [])
-                for e in same_name:
-                    ek = _entry_key(e)
-                    already = any(_entry_key(x) == ek for x in pend)
-                    if all_pending:
-                        # 복구
-                        for i, x in enumerate(pend):
-                            if _entry_key(x) == ek:
-                                del pend[i]
-                                break
-                    elif not already:
-                        pend.append(dict(e))
-                update_timetable_view()
+                if len(unmanaged) == 1:
+                    # 단일 엔트리 → 같은 과목명 전체 토글 (기존 동작)
+                    target_subj = (unmanaged[0].get('subject') or '').strip()
+                    same_name = [
+                        e for _lst in tt_state.get('unmanaged_by_cell', {}).values()
+                        for e in (_lst if isinstance(_lst, list) else [_lst])
+                        if isinstance(e, dict) and (e.get('subject') or '').strip() == target_subj
+                    ] + [
+                        e for e in tt_state.get('off_grid_entries', [])
+                        if (e.get('subject') or '').strip() == target_subj
+                    ]
+                    all_pending = all(is_pending_delete(e) for e in same_name)
+                    pend = tt_state.setdefault('pending_deletions', [])
+                    for e in same_name:
+                        ek = _entry_key(e)
+                        already = any(_entry_key(x) == ek for x in pend)
+                        if all_pending:
+                            for i, x in enumerate(pend):
+                                if _entry_key(x) == ek:
+                                    del pend[i]
+                                    break
+                        elif not already:
+                            pend.append(dict(e))
+                    update_timetable_view()
+                else:
+                    # 중복 다수 → 개별 선택 팝업
+                    menu = ctk.CTkToplevel(pop)
+                    menu.title('중복 삭제 선택')
+                    self._style_popup(menu, '280x320', minsize=(260, 280))
+                    menu.transient(pop)
+                    menu.focus_force()
+                    ctk.CTkLabel(
+                        menu, text='삭제할 항목을 선택하세요',
+                        font=('Pretendard', 13, 'bold')
+                    ).pack(pady=(12, 6))
+                    pend = tt_state.setdefault('pending_deletions', [])
+                    chk_vars = []
+                    for e in unmanaged:
+                        var = ctk.BooleanVar(value=is_pending_delete(e))
+                        chk_vars.append((e, var))
+                        self._style_checkbox(ctk.CTkCheckBox(
+                            menu,
+                            text=f"{e.get('subject','')}  #{e.get('checkbox_value','')}",
+                            variable=var,
+                            font=('Pretendard', 12),
+                        )).pack(anchor='w', padx=16, pady=4)
+
+                    def _apply():
+                        for e, var in chk_vars:
+                            ek = _entry_key(e)
+                            already_idx = next(
+                                (i for i, x in enumerate(pend) if _entry_key(x) == ek), -1
+                            )
+                            if var.get() and already_idx == -1:
+                                pend.append(dict(e))
+                            elif not var.get() and already_idx != -1:
+                                del pend[already_idx]
+                        update_timetable_view()
+                        menu.destroy()
+
+                    self._make_button(menu, text='적용', variant='primary',
+                                      command=_apply).pack(pady=10, padx=16, fill='x')
                 return
             if not matches:
                 return
@@ -4040,7 +4045,7 @@ class AraonWorkstation(ctk.CTk):
                             if not subj:
                                 continue
                             if day_ in days and time_ in base_times:
-                                unmanaged_by_cell[(day_, time_)] = dict(e_)
+                                unmanaged_by_cell.setdefault((day_, time_), []).append(dict(e_))
                             else:
                                 off_grid_entries.append(dict(e_))
                     tt_state['existing_entries'] = managed_entries
@@ -4117,10 +4122,12 @@ class AraonWorkstation(ctk.CTk):
                         ]
                         # 삭제 처리된 비관리 엔트리는 목록에서 제거
                         deleted_keys = {_entry_key(e) for e in pending_del}
-                        tt_state['unmanaged_by_cell'] = {
-                            k: v for k, v in tt_state.get('unmanaged_by_cell', {}).items()
-                            if _entry_key(v) not in deleted_keys
-                        }
+                        new_unmanaged = {}
+                        for k, lst in tt_state.get('unmanaged_by_cell', {}).items():
+                            kept = [e for e in lst if _entry_key(e) not in deleted_keys]
+                            if kept:
+                                new_unmanaged[k] = kept
+                        tt_state['unmanaged_by_cell'] = new_unmanaged
                         tt_state['off_grid_entries'] = [
                             e for e in tt_state.get('off_grid_entries', [])
                             if _entry_key(e) not in deleted_keys
@@ -4128,8 +4135,8 @@ class AraonWorkstation(ctk.CTk):
                         tt_state['pending_deletions'] = []
                         try:
                             update_timetable_view()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            write_log(f'시간표 뷰 갱신 오류: {_e}')
                         write_log('배정 완료 → 시간표 조회 창을 엽니다.')
                         # 완료 후 시간표 보기 창 자동 실행
                         threading.Thread(
@@ -4299,7 +4306,6 @@ class AraonWorkstation(ctk.CTk):
 
     def _tt_search_members(self, driver, keyword: str, log_cb, limit: int = 15) -> list:
         """memList.asp 검색으로 학생 목록 반환. 학년 정보도 함께 파싱."""
-        from urllib.parse import quote_plus
         keyword = (keyword or '').strip()
         if not keyword:
             return []
@@ -4702,20 +4708,27 @@ class AraonWorkstation(ctk.CTk):
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
                     ).click()
 
-                    # 검색 후 AJAX 갱신 대기 — 노드가 DOM에 안착할 때까지 재시도
+                    # 검색 후 AJAX 2중 렌더 대기
+                    # presence_of_element_located 후 DOM이 교체되는 경우 방지:
+                    # 요소 발견 → 추가 대기 → fresh find 로 재참조 후 클릭
                     checkbox = None
-                    for _attempt in range(3):
+                    for _attempt in range(5):
                         try:
-                            time.sleep(0.4)
-                            checkbox = WebDriverWait(driver, 5).until(
+                            time.sleep(0.8)
+                            WebDriverWait(driver, 6).until(
                                 EC.presence_of_element_located((By.NAME, 'onair_seqs'))
                             )
-                            driver.execute_script('arguments[0].click();', checkbox)
+                            time.sleep(0.3)   # AJAX 2차 렌더 완료 대기
+                            elems = driver.find_elements(By.NAME, 'onair_seqs')
+                            if not elems:
+                                continue
+                            driver.execute_script('arguments[0].click();', elems[0])
+                            checkbox = elems[0]
                             break
                         except Exception:
                             checkbox = None
                     if checkbox is None:
-                        raise RuntimeError('checkbox 클릭 실패 (3회 재시도)')
+                        raise RuntimeError('checkbox 클릭 실패 (5회 재시도)')
 
                     driver.find_element(
                         By.XPATH,
@@ -4758,18 +4771,23 @@ class AraonWorkstation(ctk.CTk):
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
                     ).click()
                     checkbox = None
-                    for _attempt in range(3):
+                    for _attempt in range(5):
                         try:
-                            time.sleep(0.4)
-                            checkbox = WebDriverWait(driver, 5).until(
+                            time.sleep(0.8)
+                            WebDriverWait(driver, 6).until(
                                 EC.presence_of_element_located((By.NAME, 'onair_seqs'))
                             )
-                            driver.execute_script('arguments[0].click();', checkbox)
+                            time.sleep(0.3)
+                            elems = driver.find_elements(By.NAME, 'onair_seqs')
+                            if not elems:
+                                continue
+                            driver.execute_script('arguments[0].click();', elems[0])
+                            checkbox = elems[0]
                             break
                         except Exception:
                             checkbox = None
                     if checkbox is None:
-                        raise RuntimeError('checkbox 클릭 실패 (3회 재시도)')
+                        raise RuntimeError('checkbox 클릭 실패 (5회 재시도)')
                     driver.find_element(
                         By.XPATH,
                         "//input[@type='button' and @value='방송수업개별배정']"
