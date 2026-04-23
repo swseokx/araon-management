@@ -65,14 +65,26 @@ class ConfigManager:
 
     def _ensure_sections(self):
         for section in ['MAIN_SHEET', 'KAKAO_STATS', 'SETTINGS', 'AS_TEMPLATES',
-                        'COPY_BUTTONS', 'COMPANY_SITE', 'LMS', 'UPDATE', 'ADMISSION']:
+                        'COPY_BUTTONS', 'COMPANY_SITE', 'LMS', 'UPDATE', 'ADMISSION',
+                        'KAKAO_COORDS']:
             if not self.config.has_section(section):
                 self.config.add_section(section)
+        # 카톡 매크로 좌표 모드 기본값
+        if not self.config.has_option('SETTINGS', 'kakao_macro_mode'):
+            self.config.set('SETTINGS', 'kakao_macro_mode', 'coords')
+        for k, v in [('send_x', '0'), ('send_y', '0'),
+                     ('now_x', '0'), ('now_y', '0'),
+                     ('complete_x', '0'), ('complete_y', '0'),
+                     ('ok_x', '0'), ('ok_y', '0')]:
+            if not self.config.has_option('KAKAO_COORDS', k):
+                self.config.set('KAKAO_COORDS', k, v)
         # 단가 키 신규 추가 (기존 파일 호환)
         if not self.config.has_option('SETTINGS', 'kakao_rate'):
             self.config.set('SETTINGS', 'kakao_rate', '500')
         if not self.config.has_option('SETTINGS', 'setup_rate'):
             self.config.set('SETTINGS', 'setup_rate', '3000')
+        if not self.config.has_option('SETTINGS', 'kakao_confidence'):
+            self.config.set('SETTINGS', 'kakao_confidence', '0.6')
         # 자동업데이트 기본값 (기존 파일 호환)
         _CORRECT_REPO = 'swseokx/araon-management'
         current_repo = self.config.get('UPDATE', 'repo', fallback='').strip()
@@ -106,6 +118,12 @@ class ConfigManager:
 
     def get_setup_rate(self) -> int:
         return int(self.get('SETTINGS', 'setup_rate', '3000'))
+
+    def get_kakao_confidence(self) -> float:
+        try:
+            return float(self.get('SETTINGS', 'kakao_confidence', '0.6'))
+        except ValueError:
+            return 0.6
 
     # ------------------------------------------------------------------
     # 보안 자격증명 (keyring 우선, fallback: ini 평문 — 마이그레이션용)

@@ -70,7 +70,13 @@ class SeleniumManager:
         path = SeleniumManager._resolve_driver_path()
         opts = Options()
         opts.add_argument(f'--user-data-dir={profile_dir}')
+        opts.add_argument('--disable-popup-blocking')
         opts.page_load_strategy = page_load_strategy
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.popups": 1,
+        }
+        opts.add_experimental_option("prefs", prefs)
         return webdriver.Chrome(service=Service(path), options=opts)
 
     @staticmethod

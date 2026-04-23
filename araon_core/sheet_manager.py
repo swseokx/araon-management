@@ -4,6 +4,7 @@ araon_core/sheet_manager.py
 """
 
 import os
+import re
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -12,6 +13,10 @@ _SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r'\s+', '', (name or '').strip()).lower()
 
 
 class SheetManager:
@@ -60,7 +65,7 @@ class SheetManager:
 
     def _get_admission_sheet(self):
         """입학식 관리 시트 (별도 스프레드시트).
-        sheet_name 으로 먼저 시도, 실패 시 sheet_gid(숫자) 로 폴백.
+        sheet_gid(숫자) 를 우선 사용하고, 없거나 실패 시 sheet_name 으로 폴백.
         """
         if self._admission_sheet is not None:
             return self._admission_sheet
@@ -71,13 +76,13 @@ class SheetManager:
         sheet_gid  = self.cfg.get('ADMISSION', 'sheet_gid', '1161990906')
         spreadsheet = client.open_by_key(sheet_id)
         try:
-            self._admission_sheet = spreadsheet.worksheet(sheet_name)
+            self._admission_sheet = spreadsheet.get_worksheet_by_id(int(sheet_gid))
         except Exception:
-            # 이름으로 못 찾으면 gid 로 폴백
+            # gid 로 못 찾으면 이름으로 폴백
             try:
-                self._admission_sheet = spreadsheet.get_worksheet_by_id(int(sheet_gid))
+                self._admission_sheet = spreadsheet.worksheet(sheet_name)
             except Exception:
-                # gid 도 안 되면 첫 번째 시트
+                # 둘 다 안 되면 첫 번째 시트
                 self._admission_sheet = spreadsheet.get_worksheet(0)
         return self._admission_sheet
 
@@ -206,10 +211,7 @@ class SheetManager:
         a_col = [r[0] if r else '' for r in existing[0]]
         c_col = [r[0] if r else '' for r in existing[1]]
 
-        existing_names = {
-            str(c).replace(' ', '').strip()
-            for c in c_col if str(c).strip()
-        }
+        existing_names = {_normalize_name(str(c)) for c in c_col if str(c).strip()}
         date_already_present = any(
             str(a).strip() == date_full for a in a_col
         )
@@ -218,11 +220,12 @@ class SheetManager:
         skipped = 0
         new_rows = []
         for row in rows:
-            name = str(row[0]).replace(' ', '').strip() if len(row) > 0 else ''
+            raw_name = str(row[0]).strip() if len(row) > 0 else ''
+            norm_name = _normalize_name(raw_name)   # 중복 비교용만
             time_ = str(row[2]).strip() if len(row) > 2 else ''
-            if not name:
+            if not norm_name:
                 continue
-            if name in existing_names:
+            if norm_name in existing_names:
                 skipped += 1
                 continue
 
@@ -231,12 +234,12 @@ class SheetManager:
             if not date_already_present:
                 date_already_present = True
 
-            # A, B, C, D(미사용), E(시간), F~M(체크리스트 공란)
+            # A, B, C(원본 이름), D(미사용), E(시간), F~M(체크리스트 공란)
             new_rows.append([
-                a_val, dow_marker, name, '', time_,
+                a_val, dow_marker, raw_name, '', time_,
                 '', '', '', '', '', '', '', ''
             ])
-            existing_names.add(name)
+            existing_names.add(norm_name)
             added += 1
 
         if new_rows:
@@ -258,20 +261,20 @@ class SheetManager:
         sheet = self._get_admission_sheet()
         c_col = sheet.col_values(3)
 
-        clean_name = name.replace(' ', '').strip()
+        clean_name = _normalize_name(name)
         target_row = -1
         for i, val in enumerate(c_col):
-            if str(val).replace(' ', '').strip() == clean_name:
+            if _normalize_name(str(val)) == clean_name:
                 target_row = i + 1
                 break
 
         if target_row == -1:
             return False
 
-        # F=안내문자, G=카톡, H=레벨, I=노트, J=첫수업, K=폼, L=시간표발송, M=시간표배정
+        # 저장 완료 시 E(입학식 시간)는 O로 바꾸고, F~M 체크리스트를 갱신한다.
         sheet.update(
-            f'F{target_row}:M{target_row}',
-            [[notice_msg, kakao, level_test, note, first_class,
+            f'E{target_row}:M{target_row}',
+            [['O', notice_msg, kakao, level_test, note, first_class,
               form_reg, timetable_send, schedule]],
             value_input_option='USER_ENTERED'
         )
@@ -293,7 +296,7 @@ class SheetManager:
         if start_r == -1:
             return False
 
-        clean_name = name.strip()
+        clean_name = _normalize_name(name)
         target_row = -1
         for i in range(start_r, max(len(b_col), len(e_col))):
             if i < len(b_col):
@@ -301,7 +304,7 @@ class SheetManager:
                 if bval and '/' in bval and selected_date not in bval:
                     break
             if i < len(e_col):
-                cell_name = str(e_col[i]).strip()
+                cell_name = _normalize_name(str(e_col[i]))
                 if cell_name == clean_name:
                     target_row = i + 1
                     break
@@ -327,7 +330,7 @@ class SheetManager:
         sheet = self._get_admission_sheet()
         all_rows = sheet.get_all_values()
 
-        wanted = {str(n).replace(' ', '').strip() for n in names if n}
+        wanted = {_normalize_name(str(n)) for n in names if n}
         # 디버그: 시트의 C열 값 목록 확인 (처음 30행)
         c_col_sample = [
             (row[2] if len(row) > 2 else '') for row in all_rows[:30]
@@ -340,8 +343,8 @@ class SheetManager:
                 return r[i].strip() if i < len(r) else ''
 
             # 신 스키마 우선 (C열), 구 스키마 폴백 (B열)
-            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
-            b_name = (row[1] if len(row) > 1 else '').replace(' ', '').strip()
+            c_name = _normalize_name(row[2] if len(row) > 2 else '')
+            b_name = _normalize_name(row[1] if len(row) > 1 else '')
 
             if c_name and c_name in wanted:
                 matched_name = c_name
@@ -362,36 +365,6 @@ class SheetManager:
                 'form':        _g(offset + 5),  # K / J
                 'tt_send':     _g(offset + 6),  # L / K
                 'schedule':    _g(offset + 7),  # M / L
-            }
-        return result
-
-    def get_admission_checklists(self, date_str: str) -> dict[str, dict]:
-        """[DEPRECATED] 날짜 기반 조회 — 호환용 shim. 새 코드는 by_names 사용."""
-        sheet = self._get_admission_sheet()
-        all_rows = sheet.get_all_values()
-        date_full, _ = self._date_full_and_dow(date_str)
-
-        result: dict[str, dict] = {}
-        for row in all_rows:
-            row_date = row[0].strip() if len(row) > 0 else ''
-            # 새 스키마(A="4/22 (수)") / 구 스키마(A="4/22") 모두 대응
-            if row_date != date_str and row_date != date_full:
-                continue
-            c_name = (row[2] if len(row) > 2 else '').replace(' ', '').strip()
-            if not c_name:
-                continue
-
-            def _g(i, r=row):
-                return r[i].strip() if i < len(r) else ''
-            result[c_name] = {
-                'notice':      _g(5),
-                'kakao':       _g(6),
-                'level':       _g(7),
-                'note':        _g(8),
-                'first_class': _g(9),
-                'form':        _g(10),
-                'tt_send':     _g(11),
-                'schedule':    _g(12),
             }
         return result
 

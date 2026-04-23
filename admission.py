@@ -147,10 +147,49 @@ class AdmissionApp(ctk.CTk):
             self.cfg.get('SETTINGS', 'appearance_mode', 'dark')
         )
 
+        # 아이콘 적용 (메인창 + 이후 생성되는 모든 CTkToplevel 팝업)
+        self._icon_path = self._resolve_icon_path()
+        if self._icon_path:
+            try:
+                self.iconbitmap(self._icon_path)
+            except Exception:
+                pass
+        self._patch_toplevel_icon()
+
         self._ensure_admission_config()
         self._build_ui()
         self.log.write_system('--- 입학식 프로그램 가동 ---')
         self.load_students_async()
+
+    def _resolve_icon_path(self) -> str:
+        """favicon.ico 경로 탐색. 개발/배포/PyInstaller bundle 순."""
+        candidates = [
+            os.path.join(self.base_path, 'favicon.ico'),
+            os.path.join(self.base_path, '..', 'img', 'favicon.ico'),
+            os.path.join(self.base_path, '..', 'favicon.ico'),
+        ]
+        if hasattr(sys, '_MEIPASS'):
+            candidates.insert(0, os.path.join(sys._MEIPASS, 'favicon.ico'))
+        for p in candidates:
+            if os.path.exists(p):
+                return os.path.abspath(p)
+        return ''
+
+    def _patch_toplevel_icon(self):
+        """이후 생성되는 모든 CTkToplevel에 자동으로 아이콘 적용 (monkey patch)."""
+        icon_path = self._icon_path
+        if not icon_path:
+            return
+        orig_init = ctk.CTkToplevel.__init__
+
+        def patched(self_, *args, **kwargs):
+            orig_init(self_, *args, **kwargs)
+            try:
+                self_.after(100, lambda: self_.iconbitmap(icon_path))
+            except Exception:
+                pass
+
+        ctk.CTkToplevel.__init__ = patched
 
     def _ensure_admission_config(self):
         if not self.cfg.config.has_section('ADMISSION'):

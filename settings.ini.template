@@ -12,6 +12,19 @@ appearance_mode = dark
 popup_topmost = False
 kakao_rate = 500
 setup_rate = 3000
+kakao_confidence = 0.6
+kakao_macro_mode = coords
+
+[KAKAO_COORDS]
+; 활성 카톡창 좌상단(0,0) 기준 offset. 환경설정 → 📍 카톡 좌표 캡처 로 자동 설정
+send_x = 0
+send_y = 0
+now_x = 0
+now_y = 0
+complete_x = 0
+complete_y = 0
+ok_x = 0
+ok_y = 0
 
 [AS_TEMPLATES]
 list = 프로그램 재설치,수업 입장 안 됨,수업 소리 안 들림,프린터기 설치,베이직북 AS 안내,교과 강의 재생 안 됨
@@ -53,6 +66,18 @@ btn_15_text =
 [COMPANY_SITE]
 url = https://lmsone.com/wcms
 
+[UPDATE]
+; GitHub 저장소 (owner/repo 형식), 비워두면 자동업데이트 비활성화
+repo = swseokx/araon-management
+; 비공개 저장소인 경우 읽기 전용 Fine-grained token 입력 (공개이면 빈칸)
+token =
+
 [ADMISSION]
 spreadsheet_id = 1ktQojus9PUzY-_3zYTGDxC8SCgmQoff5K1910ZzhNEc
 sheet_name = 입학식 관리
+
+[LMS]
+; 일괄 강의방 등록용 수업방 URL (방송수업관리 → 본인 수업방 페이지의 주소)
+; 개통방/입학식방 등 본인이 학생을 등록할 방의 URL
+; 예: https://www.lmsone.com/wcms/onAirClass/onAirClassWrite.asp?onair_seq=19130&mode=U&class_cd=6101&...
+class_room_url =

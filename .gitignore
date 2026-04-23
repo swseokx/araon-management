@@ -15,7 +15,8 @@ __pycache__/
 # ── PyInstaller 빌드 결과물 ───────────────────────────────────
 dist/
 build/
-*.spec
+release/
+ARAON_v*.zip
 
 # ── Python 가상환경 ───────────────────────────────────────────
 venv/

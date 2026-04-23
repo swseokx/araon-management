@@ -8,6 +8,7 @@ import threading
 import re
 import traceback
 import json
+import subprocess
 
 import pyperclip
 import keyboard
@@ -21,7 +22,7 @@ import numpy as np
 from tkinter import messagebox, Listbox
 from tkcalendar import Calendar
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -69,6 +70,11 @@ def _is_running_from_temp(base_path: str) -> bool:
     return any(mark in p for mark in temp_markers)
 
 
+def _normalize_person_name(name: str) -> str:
+    """이름 비교용 정규화: 모든 공백 제거 + 소문자."""
+    return re.sub(r'\s+', '', (name or '').strip()).lower()
+
+
 # ─────────────────────────────────────────────
 #  메인 앱
 # ─────────────────────────────────────────────
@@ -101,9 +107,11 @@ class AraonWorkstation(ctk.CTk):
         self.row_widgets: dict[int, list] = {}
         self.admission_row_widgets: dict[int, list] = {}
         self.work_drivers: dict = {}
+        self._ezview_debug_driver = None
         self.qc_pop = None
         self._monitor_visible: bool = True
         self._admission_needs_render: bool = False
+        self._closing: bool = False
 
         # 알람 상태 (render_grid 에서 초기화하지 않음)
         self.alarm_states: dict = {}          # 개통/AS 탭: {row_idx: state}
@@ -133,6 +141,7 @@ class AraonWorkstation(ctk.CTk):
         )
 
         self.setup_main_ui()
+        self.update_idletasks()   # tab_view 렌더 완료 후 복원
         self._restore_last_tab()
         self.update_kakao_ui()
         self.update_time_display()
@@ -199,6 +208,117 @@ class AraonWorkstation(ctk.CTk):
         else:
             messagebox.showinfo(title, msg)
 
+    def _colors(self) -> dict:
+        return getattr(self, '_palette', {})
+
+    def _button_theme(self, variant: str = 'secondary') -> dict:
+        C = self._colors()
+        styles = {
+            'primary': {
+                'fg_color': C.get('brand', '#0145F2'),
+                'hover_color': C.get('brand_hv', '#0136BD'),
+                'text_color': C.get('text_on_brand', '#FFFFFF'),
+            },
+            'secondary': {
+                'fg_color': C.get('secondary', '#76839A'),
+                'hover_color': C.get('secondary_hv', '#5E6A80'),
+                'text_color': C.get('text_on_secondary', '#FFFFFF'),
+            },
+            'success': {
+                'fg_color': C.get('success', '#0E9F6E'),
+                'hover_color': C.get('success_hv', '#0B8058'),
+                'text_color': C.get('text_on_brand', '#FFFFFF'),
+            },
+            'ghost': {
+                'fg_color': C.get('surface_hi', '#F6F8FB'),
+                'hover_color': C.get('surface_lo', '#E1E8F0'),
+                'text_color': C.get('text', '#18212F'),
+            },
+            'danger': {
+                'fg_color': C.get('danger', '#D14343'),
+                'hover_color': C.get('danger_hv', '#B73636'),
+                'text_color': C.get('text_on_brand', '#FFFFFF'),
+            },
+        }
+        return styles.get(variant, styles['secondary'])
+
+    def _make_button(self, parent, text: str, variant: str = 'secondary', **kwargs):
+        base = dict(
+            text=text,
+            height=36,
+            corner_radius=10,
+            font=('Pretendard', 12, 'bold'),
+        )
+        base.update(self._button_theme(variant))
+        base.update(kwargs)
+        return ctk.CTkButton(parent, **base)
+
+    def _style_popup(self, pop, geometry: str, *, minsize: tuple[int, int] | None = None):
+        C = self._colors()
+        pop.geometry(geometry)
+        if minsize:
+            pop.minsize(*minsize)
+        pop.configure(fg_color=C.get('bg', '#EDF1F5'))
+        return C
+
+    def _style_entry(self, widget):
+        C = self._colors()
+        widget.configure(
+            fg_color=C.get('surface_hi', '#F6F8FB'),
+            text_color=C.get('text', '#18212F'),
+            placeholder_text_color=C.get('text_dim', '#667085'),
+            border_color=C.get('border', '#D6DEE8'),
+        )
+        return widget
+
+    def _style_textbox(self, widget):
+        C = self._colors()
+        widget.configure(
+            fg_color=C.get('surface_hi', '#F6F8FB'),
+            text_color=C.get('text', '#18212F'),
+            border_color=C.get('border', '#D6DEE8'),
+            border_width=1,
+        )
+        return widget
+
+    def _style_optionmenu(self, widget):
+        C = self._colors()
+        widget.configure(
+            fg_color=C.get('surface_hi', '#F6F8FB'),
+            button_color=C.get('surface_lo', '#E1E8F0'),
+            button_hover_color=C.get('secondary_hv', '#5E6A80'),
+            text_color=C.get('text', '#18212F'),
+            dropdown_fg_color=C.get('surface', '#FFFFFF'),
+            dropdown_text_color=C.get('text', '#18212F'),
+            dropdown_hover_color=C.get('surface_lo', '#E1E8F0'),
+        )
+        return widget
+
+    def _style_switch(self, widget):
+        C = self._colors()
+        widget.configure(
+            progress_color=C.get('brand', '#0145F2'),
+            button_color=C.get('surface', '#FFFFFF'),
+            button_hover_color=C.get('surface_lo', '#E1E8F0'),
+            text_color=C.get('text', '#18212F'),
+        )
+        return widget
+
+    def _style_checkbox(self, widget):
+        C = self._colors()
+        is_dark = ctk.get_appearance_mode().lower() == 'dark'
+        # 다크모드: 밝은 테두리로 빈 체크박스 명확히 구분
+        border_col = '#8FA0B0' if is_dark else '#6B7280'
+        widget.configure(
+            fg_color=C.get('brand', '#0145F2'),
+            hover_color=C.get('brand_hv', '#0136BD'),
+            border_color=border_col,
+            border_width=2,
+            checkmark_color=C.get('text_on_brand', '#FFFFFF'),
+            text_color=C.get('text', '#18212F'),
+        )
+        return widget
+
     # ──────────────────────────────────────────
     #  LMS 캐시 관리
     # ──────────────────────────────────────────
@@ -239,17 +359,30 @@ class AraonWorkstation(ctk.CTk):
     def open_full_log(self):
         pop = ctk.CTkToplevel(self)
         pop.title(f"오늘의 시스템 로그 - {datetime.now().strftime('%Y-%m-%d')}")
-        pop.geometry('700x500')
+        C = self._style_popup(pop, '760x540', minsize=(680, 440))
         pop.transient(self)
         pop.attributes('-topmost', True)
         pop.lift()
         pop.focus_force()
 
-        txt = ctk.CTkTextbox(
-            pop, font=('Consolas', 13),
-            fg_color='#1e1e1e', text_color='#2ecc71'
+        shell = ctk.CTkFrame(
+            pop, fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14, border_width=1, border_color=C.get('border', '#D6DEE8')
         )
-        txt.pack(fill='both', expand=True, padx=10, pady=10)
+        shell.pack(fill='both', expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            shell, text='시스템 로그',
+            font=('Pretendard', 15, 'bold'),
+            text_color=C.get('text', '#18212F'),
+        ).pack(anchor='w', padx=16, pady=(14, 6))
+
+        txt = self._style_textbox(ctk.CTkTextbox(shell, font=('Consolas', 13)))
+        txt.configure(
+            fg_color=C.get('surface_hi', '#F6F8FB'),
+            text_color=C.get('success', '#0E9F6E'),
+        )
+        txt.pack(fill='both', expand=True, padx=16, pady=(0, 16))
         txt.insert('end', self.log.read_system_today())
         txt.configure(state='disabled')
         txt.see('end')
@@ -293,14 +426,16 @@ class AraonWorkstation(ctk.CTk):
             toast.title('알림')
             toast.overrideredirect(True)
             toast.attributes('-topmost', True)
+            C = self._colors()
 
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
             w, h = 330, 110
             toast.geometry(f'{w}x{h}+{sw - w - 20}+{sh - h - 60}')
 
-            border_color = '#27ae60' if on_click else '#e67e22'
+            border_color = C.get('brand', '#0145F2') if on_click else C.get('warning', '#0145F2')
             f = ctk.CTkFrame(
-                toast, fg_color='#1f538d',
+                toast,
+                fg_color=C.get('surface', '#FFFFFF'),
                 border_width=2, border_color=border_color, corner_radius=10
             )
             f.pack(fill='both', expand=True)
@@ -309,13 +444,18 @@ class AraonWorkstation(ctk.CTk):
 
             ctk.CTkLabel(
                 f, text=title,
-                font=('Pretendard', 14, 'bold'), text_color='#f1c40f'
+                font=('Pretendard', 14, 'bold'),
+                text_color=C.get('brand', '#0145F2') if on_click else C.get('warning', '#0145F2')
             ).pack(pady=(12, 5))
-            ctk.CTkLabel(f, text=msg, font=('Pretendard', 12)).pack(padx=10, pady=(0, 10))
+            ctk.CTkLabel(
+                f, text=msg, font=('Pretendard', 12),
+                text_color=C.get('text', '#18212F')
+            ).pack(padx=10, pady=(0, 10))
             if on_click:
                 hint = ctk.CTkLabel(
                     f, text='▶ 클릭하면 상세 팝업이 열립니다',
-                    font=('Pretendard', 10), text_color='#aaaaaa'
+                    font=('Pretendard', 10),
+                    text_color=C.get('text_dim', '#667085')
                 )
                 hint.pack(pady=(0, 6))
                 hint.configure(cursor='hand2')
@@ -971,6 +1111,15 @@ class AraonWorkstation(ctk.CTk):
 
     def _on_close(self):
         """앱 종료 시 현재 탭 저장."""
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if self._ezview_debug_driver:
+                SeleniumManager.safe_quit(self._ezview_debug_driver)
+                self._ezview_debug_driver = None
+        except Exception:
+            pass
         try:
             self.cfg.set('SETTINGS', 'last_tab', self._get_current_tab())
             self.cfg.save()
@@ -1053,33 +1202,41 @@ class AraonWorkstation(ctk.CTk):
         # customtkinter 는 튜플 첫번째 = light, 두번째 = dark
         C = self._palette = {
             # 바탕 / 표면
-            'bg':         ('#f1f5f9', '#0f172a'),   # 창 배경
-            'surface':    ('#ffffff', '#1e293b'),   # 카드/탭
-            'surface_hi': ('#f8fafc', '#111827'),   # 스크롤 영역
-            'nav':        ('#ffffff', '#0f172a'),   # 상단 nav 배경
-            'status':     ('#0f172a', '#020617'),   # 상태바
-            'border':     ('#e2e8f0', '#334155'),
-            'text':       ('#0f172a', '#f1f5f9'),
-            'text_dim':   ('#64748b', '#94a3b8'),
+            'bg':         ('#EDF1F5', '#2B2B2B'),
+            'surface':    ('#FFFFFF', '#242A33'),
+            'surface_hi': ('#F6F8FB', '#1C2129'),
+            'surface_lo': ('#E1E8F0', '#2E3642'),
+            'nav':        ('#FFFFFF', '#171B22'),
+            'status':     ('#DCE4EE', '#14181E'),
+            'border':     ('#D6DEE8', '#364150'),
+            'text':       ('#18212F', '#F4F7FB'),
+            'text_dim':   ('#667085', '#B2BDCF'),
+            'chip':       ('#F7FAFD', '#27303B'),
+            'chip_alt':   ('#EAF0FF', '#213453'),
+            'header_band':('#EAF0FF', '#263754'),
+            'header_band_alt':('#E4ECFF', '#243A5A'),
             # 액션 컬러
-            'brand':      ('#2563eb', '#3b82f6'),
-            'brand_hv':   ('#1d4ed8', '#2563eb'),
-            'secondary':  ('#475569', '#475569'),
-            'secondary_hv':('#334155', '#334155'),
-            'success':    ('#059669', '#10b981'),
-            'success_hv': ('#047857', '#059669'),
-            'warning':    ('#d97706', '#f59e0b'),
-            'warning_hv': ('#b45309', '#d97706'),
-            'danger':     ('#dc2626', '#ef4444'),
-            'danger_hv':  ('#b91c1c', '#dc2626'),
-            'violet':     ('#7c3aed', '#8b5cf6'),
-            'violet_hv':  ('#6d28d9', '#7c3aed'),
-            'teal':       ('#0d9488', '#14b8a6'),
-            'teal_hv':    ('#0f766e', '#0d9488'),
-            'orange':     ('#ea580c', '#f97316'),
-            'orange_hv':  ('#c2410c', '#ea580c'),
-            'indigo':     ('#4f46e5', '#6366f1'),
-            'indigo_hv':  ('#4338ca', '#4f46e5'),
+            'brand':      ('#0145F2', '#2A61FF'),
+            'brand_hv':   ('#0136BD', '#4877FF'),
+            'secondary':  ('#76839A', '#4F6078'),
+            'secondary_hv':('#5E6A80', '#5E7090'),
+            'success':    ('#0E9F6E', '#49C58D'),
+            'success_hv': ('#0B8058', '#3CB27D'),
+            'warning':    ('#0145F2', '#7AA2FF'),
+            'warning_hv': ('#0136BD', '#5F89FF'),
+            'danger':     ('#D14343', '#F07F88'),
+            'danger_hv':  ('#B73636', '#E96D77'),
+            'violet':     ('#4D78F3', '#5F89FF'),
+            'violet_hv':  ('#3F65D0', '#4C7AFF'),
+            'teal':       ('#0145F2', '#6EC8FF'),
+            'teal_hv':    ('#0136BD', '#5BB7F0'),
+            'orange':     ('#0145F2', '#4474FF'),
+            'orange_hv':  ('#0136BD', '#376AFF'),
+            'indigo':     ('#0145F2', '#376AFF'),
+            'indigo_hv':  ('#0136BD', '#2A61FF'),
+            'text_on_brand': ('#FFFFFF', '#FFFFFF'),
+            'text_on_warning': ('#FFFFFF', '#FFFFFF'),
+            'text_on_secondary': ('#FFFFFF', '#FFFFFF'),
         }
 
         # 창 배경
@@ -1122,57 +1279,42 @@ class AraonWorkstation(ctk.CTk):
         ver_lbl.bind('<Button-1>', lambda e: self._show_patch_notes())
 
         # 날짜 버튼
-        self.date_btn = ctk.CTkButton(
-            nav, text=f'📅 {self.selected_date}', height=36,
-            font=('Pretendard', 14, 'bold'),
-            fg_color=C['brand'], hover_color=C['brand_hv'],
-            corner_radius=8,
+        self.date_btn = self._make_button(
+            nav, text=f'📅 {self.selected_date}', variant='primary',
+            height=38, width=140, font=('Pretendard', 14, 'bold'),
             command=self.open_calendar,
         )
         self.date_btn.pack(side='left', padx=6)
 
-        # 일반 액션 버튼 공통 스타일
-        btn_kw = dict(height=36, corner_radius=8,
-                      font=('Pretendard', 12, 'bold'))
-
-        ctk.CTkButton(
-            nav, text='⚙ 환경설정', width=100,
-            fg_color=C['secondary'], hover_color=C['secondary_hv'],
-            command=self.open_settings_menu, **btn_kw,
+        self._make_button(
+            nav, text='⚙ 환경설정', width=104, variant='secondary',
+            command=self.open_settings_menu
         ).pack(side='left', padx=4)
-        ctk.CTkButton(
-            nav, text='🔄 새로고침', width=100,
-            fg_color=C['indigo'], hover_color=C['indigo_hv'],
-            command=self.load_sheet_data_async, **btn_kw,
+        self._make_button(
+            nav, text='🔄 새로고침', width=104, variant='secondary',
+            command=self.load_sheet_data_async
         ).pack(side='left', padx=4)
-        ctk.CTkButton(
-            nav, text='👨‍🎓 일괄 등록', width=115,
-            fg_color=C['violet'], hover_color=C['violet_hv'],
-            command=self.start_bulk_enroll, **btn_kw,
+        self._make_button(
+            nav, text='👨‍🎓 일괄 등록', width=118, variant='ghost',
+            command=self.start_bulk_enroll
         ).pack(side='left', padx=(12, 4))
-        ctk.CTkButton(
-            nav, text='🎯 출석체크 저장', width=130,
-            fg_color=C['teal'], hover_color=C['teal_hv'],
-            command=self.start_attend_check, **btn_kw,
+        self._make_button(
+            nav, text='🎯 출석체크 저장', width=132, variant='ghost',
+            command=self.start_attend_check
         ).pack(side='left', padx=4)
-        ctk.CTkButton(
-            nav, text='📅 시간표 작성', width=110,
-            fg_color=C['success'], hover_color=C['success_hv'],
-            command=self.open_timetable_popup, **btn_kw,
+        self._make_button(
+            nav, text='📅 시간표 작성', width=114, variant='primary',
+            command=self.open_timetable_popup
         ).pack(side='left', padx=4)
-        ctk.CTkButton(
-            nav, text='📋 퀵카피', width=90,
-            fg_color=C['orange'], hover_color=C['orange_hv'],
-            command=self.open_quick_copy_window, **btn_kw,
+        self._make_button(
+            nav, text='📋 퀵카피', width=96, variant='secondary',
+            command=self.open_quick_copy_window
         ).pack(side='left', padx=(12, 4))
 
         # ── 우측 영역: 시간 / 라이트모드 스위치 / 모니터 토글 ──
-        self.monitor_toggle_btn = ctk.CTkButton(
-            nav, text='◀ 모니터', width=90, height=36,
-            fg_color=C['brand'], hover_color=C['brand_hv'],
-            font=('Pretendard', 12, 'bold'),
-            corner_radius=8,
-            command=self.toggle_monitor_sidebar,
+        self.monitor_toggle_btn = self._make_button(
+            nav, text='◀ 모니터', width=92, variant='secondary',
+            command=self.toggle_monitor_sidebar
         )
         self.monitor_toggle_btn.pack(side='right', padx=(6, 14))
 
@@ -1185,7 +1327,10 @@ class AraonWorkstation(ctk.CTk):
             nav, text='🌙', font=('Pretendard', 14),
             variable=self._theme_switch_var, onvalue=1, offvalue=0,
             command=self._on_theme_switch_toggle,
-            progress_color=C['warning'],
+            progress_color=C['brand'],
+            button_color=C['surface'],
+            button_hover_color=C['surface_lo'],
+            text_color=C['text'],
             width=44, height=24,
         )
         self._theme_switch.pack(side='right', padx=6)
@@ -1199,7 +1344,7 @@ class AraonWorkstation(ctk.CTk):
         # ── 상태바 (하단) ──
         self.status_bar = ctk.CTkLabel(
             self, text='  ● 시스템 대기 중', height=28,
-            fg_color=C['status'], text_color='#34d399',
+            fg_color=C['status'], text_color=C['success'],
             anchor='w', cursor='hand2',
             font=('Pretendard', 11),
         )
@@ -1208,7 +1353,7 @@ class AraonWorkstation(ctk.CTk):
 
         # ── 메인 컨테이너 ──
         container = ctk.CTkFrame(self, fg_color='transparent')
-        container.pack(fill='both', expand=True, padx=16, pady=12)
+        container.pack(fill='both', expand=True, padx=14, pady=10)
 
         # ── 탭 영역 (왼쪽) ──
         self.tab_view = ctk.CTkTabview(
@@ -1218,7 +1363,9 @@ class AraonWorkstation(ctk.CTk):
             segmented_button_selected_hover_color=C['brand_hv'],
             segmented_button_unselected_color=C['surface_hi'],
             segmented_button_unselected_hover_color=C['border'],
-            corner_radius=12,
+            corner_radius=16,
+            border_width=1,
+            border_color=C['border'],
         )
         self.tab_view.pack(side='left', fill='both', expand=True, padx=(0, 10))
         self.tab_view.add('개통/AS')
@@ -1227,28 +1374,29 @@ class AraonWorkstation(ctk.CTk):
 
         # ── 개통/AS 탭 내부 ──
         tab_open = self.tab_view.tab('개통/AS')
-        self.header_f = ctk.CTkFrame(tab_open, fg_color='#1f538d', height=40)
-        self.header_f.pack(fill='x', padx=5, pady=(5, 0))
+        self.header_f = ctk.CTkFrame(tab_open, fg_color=C['header_band'], height=42, corner_radius=12)
+        self.header_f.pack(fill='x', padx=10, pady=(10, 0))
         self.render_header()
         self.sheet_scroll = ctk.CTkScrollableFrame(
-            tab_open, fg_color=C['surface_hi'], corner_radius=8
+            tab_open, fg_color=C['surface_hi'], corner_radius=12
         )
-        self.sheet_scroll.pack(fill='both', expand=True, padx=5, pady=5)
+        self.sheet_scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
         # ── 입학식 탭 내부 ──
         tab_adm = self.tab_view.tab('입학식')
-        self.adm_header_f = ctk.CTkFrame(tab_adm, fg_color=C['teal'], height=40,
-                                           corner_radius=8)
-        self.adm_header_f.pack(fill='x', padx=5, pady=(5, 0))
+        self.adm_header_f = ctk.CTkFrame(tab_adm, fg_color=C['header_band_alt'], height=42,
+                                           corner_radius=12)
+        self.adm_header_f.pack(fill='x', padx=10, pady=(10, 0))
         self.render_admission_header()
         self.admission_scroll = ctk.CTkScrollableFrame(
-            tab_adm, fg_color=C['surface_hi'], corner_radius=8
+            tab_adm, fg_color=C['surface_hi'], corner_radius=12
         )
-        self.admission_scroll.pack(fill='both', expand=True, padx=5, pady=5)
+        self.admission_scroll.pack(fill='both', expand=True, padx=10, pady=10)
 
         # ── 사이드바: Setup Monitor (오른쪽, 토글 가능) ──
         self.monitor_frame = ctk.CTkFrame(
-            container, width=390, fg_color=C['surface'], corner_radius=12
+            container, width=330, fg_color=C['surface'], corner_radius=16,
+            border_width=1, border_color=C['border']
         )
         self.monitor_frame.pack(side='right', fill='both')
         self.monitor_frame.pack_propagate(False)
@@ -1357,9 +1505,13 @@ class AraonWorkstation(ctk.CTk):
         for t, w in cols:
             ctk.CTkLabel(
                 self.header_f, text=t, width=w,
-                font=('Pretendard', 12, 'bold')
+                font=('Pretendard', 12, 'bold'),
+                text_color=self._palette['text']
             ).pack(side='left', padx=2)
-        ctk.CTkLabel(self.header_f, text='작업', width=180).pack(side='right', padx=5)
+        ctk.CTkLabel(
+            self.header_f, text='작업', width=180,
+            text_color=self._palette['text']
+        ).pack(side='right', padx=5)
 
     def render_grid(self, data: list[list]):
         for w in self.sheet_scroll.winfo_children():
@@ -1392,8 +1544,9 @@ class AraonWorkstation(ctk.CTk):
             for i in range(start_idx, end_idx):
                 row = data[i]
                 f_row = row + [''] * 20
-                f = ctk.CTkFrame(self.sheet_scroll, fg_color=ROW_BG, corner_radius=4)
-                f.pack(fill='x', pady=1)
+                f = ctk.CTkFrame(self.sheet_scroll, fg_color=ROW_BG, corner_radius=10,
+                                 border_width=1, border_color=self._palette['border'])
+                f.pack(fill='x', pady=2)
 
                 row_w_list = []
                 for col_idx, w in COL_SPEC:
@@ -1402,20 +1555,18 @@ class AraonWorkstation(ctk.CTk):
                     row_w_list.append(lbl)
                 self.row_widgets[i] = row_w_list
 
-                ctk.CTkButton(
-                    f, text='열기', width=55, height=28, fg_color='#d35400',
+                self._make_button(
+                    f, text='열기', width=58, height=30, variant='secondary',
                     command=lambda idx=i, n=f_row[1]: self.open_work_popup(idx, n)
-                ).pack(side='right', padx=2)
-                ctk.CTkButton(
-                    f, text='강의배정<', width=65, height=28, fg_color='#2980b9',
+                ).pack(side='right', padx=2, pady=4)
+                self._make_button(
+                    f, text='강의배정', width=76, height=30, variant='primary',
                     command=lambda n=f_row[1]: self.start_individual_assign(n)
-                ).pack(side='right', padx=2)
-                ctk.CTkButton(
-                    f, text='💬카톡', width=55, height=28,
-                    fg_color='#f1c40f', text_color='black',
-                    hover_color='#f39c12',
+                ).pack(side='right', padx=2, pady=4)
+                self._make_button(
+                    f, text='카톡', width=58, height=30, variant='ghost',
                     command=lambda n=f_row[1]: self.start_kakao_search(n)
-                ).pack(side='right', padx=2)
+                ).pack(side='right', padx=2, pady=4)
 
             if end_idx < len(data):
                 self.after(10, lambda: render_chunk(end_idx))
@@ -1439,9 +1590,13 @@ class AraonWorkstation(ctk.CTk):
         for t, w in cols:
             ctk.CTkLabel(
                 self.adm_header_f, text=t, width=w,
-                font=('Pretendard', 12, 'bold')
+                font=('Pretendard', 12, 'bold'),
+                text_color=self._palette['text']
             ).pack(side='left', padx=2)
-        ctk.CTkLabel(self.adm_header_f, text='작업', width=135).pack(side='right', padx=5)
+        ctk.CTkLabel(
+            self.adm_header_f, text='작업', width=135,
+            text_color=self._palette['text']
+        ).pack(side='right', padx=5)
 
     def render_admission_grid(self, data: list[list]):
         for w in self.admission_scroll.winfo_children():
@@ -1470,26 +1625,35 @@ class AraonWorkstation(ctk.CTk):
             for i in range(start_idx, end_idx):
                 row = data[i]
                 f_row = row + [''] * 20
-                f = ctk.CTkFrame(self.admission_scroll, fg_color=ROW_BG, corner_radius=4)
-                f.pack(fill='x', pady=1)
+                f = ctk.CTkFrame(self.admission_scroll, fg_color=ROW_BG, corner_radius=10,
+                                 border_width=1, border_color=self._palette['border'])
+                f.pack(fill='x', pady=2)
 
                 row_w_list = []
                 for col_idx, w in ADM_COL_SPEC:
                     lbl = _make_cell(f, w, f_row[col_idx])
+                    if col_idx == 13:
+                        lbl.configure(
+                            text_color=(
+                                self._palette['brand']
+                                if str(f_row[col_idx]).strip()
+                                else self._palette['text_dim']
+                            )
+                        )
                     lbl.pack(side='left', padx=2)
                     row_w_list.append(lbl)
                 self.admission_row_widgets[i] = row_w_list
 
                 ot_time = str(f_row[11]).strip()
                 stu_name = str(f_row[1]).strip()
-                ctk.CTkButton(
-                    f, text='OT 팝업', width=65, height=28, fg_color='#8e44ad',
+                self._make_button(
+                    f, text='OT 팝업', width=76, height=30, variant='primary',
                     command=lambda ts=ot_time: self.open_admission_popup(ts)
-                ).pack(side='right', padx=2)
-                ctk.CTkButton(
-                    f, text='열기', width=55, height=28, fg_color='#d35400',
+                ).pack(side='right', padx=2, pady=4)
+                self._make_button(
+                    f, text='열기', width=58, height=30, variant='secondary',
                     command=lambda idx=i, n=stu_name: self.open_work_popup(idx, n)
-                ).pack(side='right', padx=2)
+                ).pack(side='right', padx=2, pady=4)
 
             if end_idx < len(data):
                 self.after(10, lambda: render_chunk(end_idx))
@@ -1498,8 +1662,15 @@ class AraonWorkstation(ctk.CTk):
             render_chunk(0)
 
     def update_time_display(self):
-        self.time_lbl.configure(text=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        self.after(1000, self.update_time_display)
+        if self._closing:
+            return
+        try:
+            if not self.winfo_exists() or not self.time_lbl.winfo_exists():
+                return
+            self.time_lbl.configure(text=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            self.after(1000, self.update_time_display)
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────
     #  퀵카피 창
@@ -1509,6 +1680,7 @@ class AraonWorkstation(ctk.CTk):
             self.qc_pop.lift()
             self.qc_pop.focus_force()
             return
+        C = getattr(self, '_palette', {})
 
         self.qc_pop = ctk.CTkToplevel(self)
         self.qc_pop.title('퀵카피 도구')
@@ -1528,11 +1700,16 @@ class AraonWorkstation(ctk.CTk):
 
         ctk.CTkSwitch(
             top_frame, text='항상 위', font=('Pretendard', 12, 'bold'),
-            variable=topmost_var, command=toggle_topmost
+            variable=topmost_var, command=toggle_topmost,
+            progress_color=C.get('brand', '#0145F2'),
+            button_color=C.get('surface', '#FFFFFF'),
+            button_hover_color=C.get('surface_lo', '#E1E8F0'),
+            text_color=C.get('text', '#18212F'),
         ).pack(side='right')
         ctk.CTkLabel(
             self.qc_pop, text='📋 퀵카피',
-            font=('Pretendard', 13, 'bold'), text_color='#28a745'
+            font=('Pretendard', 13, 'bold'),
+            text_color=C.get('brand', '#0145F2')
         ).pack(pady=(0, 10))
 
         scroll = ctk.CTkScrollableFrame(self.qc_pop, fg_color='transparent')
@@ -1542,8 +1719,12 @@ class AraonWorkstation(ctk.CTk):
             t = self.cfg.get('COPY_BUTTONS', f'btn_{i}_title', f'업무 {i}')
             c = self.cfg.get('COPY_BUTTONS', f'btn_{i}_text', '')
             if t or c:
-                ctk.CTkButton(
-                    scroll, text=t, fg_color='#333333', height=40,
+                self._make_button(
+                    scroll, text=t,
+                    fg_color=C.get('brand', '#0145F2'),
+                    hover_color=C.get('brand_hv', '#0136BD'),
+                    text_color=C.get('text_on_brand', '#FFFFFF'),
+                    height=40,
                     font=('Pretendard', 12),
                     command=lambda txt=c: [
                         pyperclip.copy(txt),
@@ -1618,7 +1799,7 @@ class AraonWorkstation(ctk.CTk):
         date_str = self._date_str_from_selected()
         pop = ctk.CTkToplevel(self)
         pop.title('SETUP 로그 편집기')
-        pop.geometry('600x500')
+        C = self._style_popup(pop, '680x560', minsize=(560, 440))
         pop.transient(self)
         pop.focus_force()
 
@@ -1626,11 +1807,8 @@ class AraonWorkstation(ctk.CTk):
             pop, text=f'[{date_str}] 로그 편집',
             font=('Pretendard', 14, 'bold')
         ).pack(pady=10)
-        txt = ctk.CTkTextbox(
-            pop, font=('Pretendard', 13),
-            fg_color='#1e1e1e', text_color='#f1c40f'
-        )
-        txt.pack(fill='both', expand=True, padx=10, pady=5)
+        txt = self._style_textbox(ctk.CTkTextbox(pop, font=('Pretendard', 13)))
+        txt.pack(fill='both', expand=True, padx=16, pady=(0, 12))
         raw = self.log.read_setup_raw(date_str)
         txt.insert(
             '1.0',
@@ -1647,16 +1825,14 @@ class AraonWorkstation(ctk.CTk):
             except Exception as e:
                 messagebox.showerror('오류', f'저장 실패: {e}', parent=pop)
 
-        ctk.CTkButton(
-            pop, text='💾 저장하기', height=40,
-            font=('Pretendard', 13, 'bold'),
-            fg_color='#27ae60', hover_color='#1e8449',
+        self._make_button(
+            pop,
+            text='저장하기',
+            variant='primary',
+            height=40,
             command=save_log
-        ).pack(pady=10, padx=20, fill='x')
+        ).pack(pady=(0, 14), padx=16, fill='x')
 
-    # ──────────────────────────────────────────
-    #  LMS 공통 드라이버 생성
-    # ──────────────────────────────────────────
     def _create_lms_driver(self, name: str):
         lms_id, lms_pw = self.cfg.get_credentials()
         try:
@@ -1675,11 +1851,11 @@ class AraonWorkstation(ctk.CTk):
             search_box.send_keys(Keys.ENTER)
             time.sleep(0.5)
 
-            # 양쪽 공백만 제거하고 내부 공백은 그대로 비교 (공백 포함 이름 지원)
-            name_norm = ' '.join(name.strip().split()).lower()
+            # 이름 비교는 모든 공백을 제거해 통일한다.
+            name_norm = _normalize_person_name(name)
             target_link = None
             for link in driver.find_elements(By.CSS_SELECTOR, 'table tbody tr a'):
-                link_norm = ' '.join(link.text.strip().split()).lower()
+                link_norm = _normalize_person_name(link.text)
                 if link_norm == name_norm or link_norm.startswith(name_norm + '('):
                     target_link = link
                     break
@@ -1866,7 +2042,7 @@ class AraonWorkstation(ctk.CTk):
 
         pop = ctk.CTkToplevel(self)
         pop.title(f'업무 처리 - {name}')
-        pop.geometry('1100x850')
+        C = self._style_popup(pop, '1080x820', minsize=(920, 700))
         pop.transient(self)
         pop.focus_force()
         pop.protocol('WM_DELETE_WINDOW', lambda: self.close_work_popup(pop, ui_row_idx))
@@ -1874,7 +2050,13 @@ class AraonWorkstation(ctk.CTk):
         is_topmost = self.cfg.getboolean('SETTINGS', 'popup_topmost', True)
         pop.attributes('-topmost', is_topmost)
 
-        info_f = ctk.CTkFrame(pop, fg_color='#2b2b2b', corner_radius=10)
+        info_f = ctk.CTkFrame(
+            pop,
+            fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14,
+            border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
         info_f.pack(fill='x', padx=20, pady=(20, 10))
 
         row1 = ctk.CTkFrame(info_f, fg_color='transparent')
@@ -1882,7 +2064,9 @@ class AraonWorkstation(ctk.CTk):
 
         id_lbl = ctk.CTkLabel(
             row1, text=f"🆔 ID: {info['id']}",
-            font=('Pretendard', 14, 'bold'), text_color='#3498db', cursor='hand2'
+            font=('Pretendard', 14, 'bold'),
+            text_color=C.get('brand', '#0145F2'),
+            cursor='hand2'
         )
         id_lbl.pack(side='left')
         id_lbl.bind(
@@ -1895,14 +2079,19 @@ class AraonWorkstation(ctk.CTk):
             text=(f"   |   👤 {info['nm']}   |   "
                   f"🏫 {info['sch']} {info['grd']}   |   "
                   f"👨‍👩‍👧 {info['p_nm']}"),
-            font=('Pretendard', 14, 'bold'), text_color='#3498db'
+            font=('Pretendard', 14, 'bold'),
+            text_color=C.get('text', '#18212F')
         ).pack(side='left')
 
         topmost_var = ctk.BooleanVar(value=is_topmost)
         ctk.CTkSwitch(
             row1, text='항상 위에',
             variable=topmost_var,
-            command=lambda: pop.attributes('-topmost', topmost_var.get())
+            command=lambda: pop.attributes('-topmost', topmost_var.get()),
+            progress_color=self._palette['brand'],
+            button_color=self._palette['surface'],
+            button_hover_color=self._palette['surface_lo'],
+            text_color=self._palette['text'],
         ).pack(side='right')
 
         row2 = ctk.CTkFrame(info_f, fg_color='transparent')
@@ -1922,7 +2111,7 @@ class AraonWorkstation(ctk.CTk):
         ).pack(side='left')
         ctk.CTkLabel(
             row2, text='   |   ',
-            font=('Pretendard', 14, 'bold'), text_color='#2ecc71'
+            font=('Pretendard', 14, 'bold'), text_color=C.get('text_dim', '#667085')
         ).pack(side='left')
         ctk.CTkLabel(
             row2, text=f"📞 학부모폰: {info['p_hp']}",
@@ -1931,22 +2120,28 @@ class AraonWorkstation(ctk.CTk):
         if n_col_val:
             ctk.CTkLabel(
                 row2, text=f'   [ 📌 N열: {n_col_val} ]',
-                font=('Pretendard', 13, 'bold'), text_color='#f1c40f'
+                font=('Pretendard', 13, 'bold'),
+                text_color=C.get('warning', '#0145F2')
             ).pack(side='left', padx=15)
 
         main_f = ctk.CTkFrame(pop, fg_color='transparent')
         main_f.pack(fill='both', expand=True, padx=20, pady=10)
 
-        left_f = ctk.CTkFrame(main_f)
+        left_f = ctk.CTkFrame(
+            main_f,
+            fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14,
+            border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
         left_f.pack(side='left', fill='both', expand=True, padx=(0, 10))
 
         ctk.CTkLabel(
             left_f, text='[ 기존 특이사항 / 상담 이력 ]',
             font=('Pretendard', 13, 'bold')
         ).pack(anchor='w', pady=(10, 5), padx=10)
-        history_box = ctk.CTkTextbox(
-            left_f, height=150, font=('Pretendard', 12),
-            fg_color='#1e1e1e', text_color='#aaaaaa'
+        history_box = self._style_textbox(
+            ctk.CTkTextbox(left_f, height=150, font=('Pretendard', 12))
         )
         history_box.pack(fill='x', padx=10, pady=(0, 10))
         history_box.insert('1.0', info['history'])
@@ -1960,11 +2155,69 @@ class AraonWorkstation(ctk.CTk):
         rb_f = ctk.CTkFrame(left_f, fg_color='transparent')
         rb_f.pack(anchor='w', padx=10)
 
-        as_f = ctk.CTkFrame(main_f, width=200)
+        # ── 퀵카피 (항상 오른쪽) ──
+        quick_copy_f = ctk.CTkFrame(
+            main_f,
+            fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14,
+            border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
+        quick_copy_f.pack(side='right', fill='y', padx=(10, 0))
+        ctk.CTkLabel(
+            quick_copy_f, text='📋 퀵카피',
+            font=('Pretendard', 12, 'bold')
+        ).pack(pady=10)
+        qc_scroll = ctk.CTkScrollableFrame(
+            quick_copy_f,
+            fg_color=C.get('surface_hi', '#F6F8FB'),
+            width=200,
+        )
+        qc_scroll.pack(fill='both', expand=True, padx=5, pady=(0, 10))
+        for i in range(1, 16):
+            t = self.cfg.get('COPY_BUTTONS', f'btn_{i}_title', f'업무 {i}')
+            c = self.cfg.get('COPY_BUTTONS', f'btn_{i}_text', '')
+            if t or c:
+                ctk.CTkButton(
+                    qc_scroll, text=t, height=32,
+                    fg_color='transparent',
+                    hover_color=C.get('surface_lo', '#E1E8F0'),
+                    text_color=C.get('text', '#18212F'),
+                    anchor='w',
+                    command=lambda txt=c: [
+                        pyperclip.copy(txt),
+                        self.write_system_log('퀵카피 복사됨')
+                    ]
+                ).pack(fill='x', pady=3)
+
+        # ── AS 상용구 패널 (quick_copy_f 왼쪽, AS선택시만 표시) ──
+        # side='right'로 나중에 pack하면 quick_copy_f 왼쪽에 붙음
+        as_f = ctk.CTkFrame(
+            main_f,
+            fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14,
+            border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
+        ctk.CTkLabel(
+            as_f, text='AS 상용구\n(더블클릭)',
+            font=('Pretendard', 12, 'bold')
+        ).pack(pady=10)
+        as_list = Listbox(
+            as_f, bg=C.get('surface_hi', '#F6F8FB'), fg=C.get('text', '#18212F'),
+            font=('Pretendard', 11), borderwidth=0,
+            highlightthickness=0,
+            selectbackground=C.get('brand', '#0145F2'),
+            selectforeground=C.get('text_on_brand', '#FFFFFF')
+        )
+        as_list.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        for tmpl in self.cfg.get('AS_TEMPLATES', 'list', '').split(','):
+            if tmpl.strip():
+                as_list.insert('end', tmpl.strip())
 
         def on_radio_change():
             if t_var.get() == 'AS':
-                as_f.pack(side='left', fill='y')
+                as_f.pack(side='right', fill='y', padx=(10, 0))
             else:
                 as_f.pack_forget()
 
@@ -1977,56 +2230,10 @@ class AraonWorkstation(ctk.CTk):
             value='AS', command=on_radio_change
         ).pack(side='left', padx=10)
 
-        memo = ctk.CTkTextbox(left_f, height=200, font=('Pretendard', 13))
-        memo.pack(fill='both', expand=True, padx=10, pady=(10, 0))
+        # ── left_f 하단 저장버튼 영역 ──
+        # left_bottom 은 save_btn 추가 후 pack 해야 height 가 0 이 아님
+        left_bottom = ctk.CTkFrame(left_f, fg_color='transparent')
 
-        # 퀵카피
-        quick_copy_f = ctk.CTkFrame(main_f, width=220)
-        quick_copy_f.pack(side='right', fill='y', padx=(10, 0))
-        ctk.CTkLabel(
-            quick_copy_f, text='📋 퀵카피',
-            font=('Pretendard', 12, 'bold')
-        ).pack(pady=10)
-        qc_scroll = ctk.CTkScrollableFrame(quick_copy_f)
-        qc_scroll.pack(fill='both', expand=True, padx=5, pady=(0, 10))
-        for i in range(1, 16):
-            t = self.cfg.get('COPY_BUTTONS', f'btn_{i}_title', f'업무 {i}')
-            c = self.cfg.get('COPY_BUTTONS', f'btn_{i}_text', '')
-            if t or c:
-                ctk.CTkButton(
-                    qc_scroll, text=t, fg_color='#333333', height=32,
-                    command=lambda txt=c: [
-                        pyperclip.copy(txt),
-                        self.write_system_log('퀵카피 복사됨')
-                    ]
-                ).pack(fill='x', pady=3)
-
-        # AS 상용구
-        ctk.CTkLabel(
-            as_f, text='AS 상용구\n(더블클릭)',
-            font=('Pretendard', 12, 'bold')
-        ).pack(pady=10)
-        as_list = Listbox(
-            as_f, bg='#2b2b2b', fg='white',
-            font=('Pretendard', 11), borderwidth=0,
-            highlightthickness=0, selectbackground='#1f538d'
-        )
-        as_list.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-        for tmpl in self.cfg.get('AS_TEMPLATES', 'list', '').split(','):
-            if tmpl.strip():
-                as_list.insert('end', tmpl.strip())
-
-        def add_text(event):
-            try:
-                sel = as_list.get(as_list.curselection())
-                memo.insert('end', f'\n- {sel}')
-            except Exception:
-                pass
-
-        as_list.bind('<Double-Button-1>', add_text)
-        on_radio_change()
-
-        # ── 저장 버튼 ──
         def save_lms():
             save_btn.configure(state='disabled', text='저장 중...')
 
@@ -2148,31 +2355,169 @@ class AraonWorkstation(ctk.CTk):
 
             threading.Thread(target=bg_task, daemon=True).start()
 
-        save_btn = ctk.CTkButton(
-            left_f, text='LMS 저장 및 완료',
-            fg_color='#28a745', height=50,
+        # ── save_btn 을 left_bottom 에 추가한 뒤 left_bottom 을 pack ──
+        # (left_bottom 이 빈 채로 pack 되면 height=0 → memo expand 에 밀림)
+        save_btn = self._make_button(
+            left_bottom, text='LMS 저장 및 완료', variant='primary', height=50,
             font=('Pretendard', 15, 'bold'), command=save_lms
         )
-        save_btn.pack(pady=15, padx=10, fill='x')
+        save_btn.pack(fill='x')
+        left_bottom.pack(side='bottom', fill='x', padx=10, pady=(6, 12))
 
-    def close_work_popup(self, pop, ui_row_idx):
-        driver = self.work_drivers.get(ui_row_idx)
-        if driver:
+        # ── memo: left_bottom pack 이후 남은 공간 채우기 ──
+        memo = self._style_textbox(ctk.CTkTextbox(left_f, height=200, font=('Pretendard', 13)))
+        memo.pack(fill='both', expand=True, padx=10, pady=(6, 4))
+
+        def add_text(event):
             try:
-                driver.switch_to.alert.accept()
+                sel = as_list.get(as_list.curselection())
+                memo.insert('end', f'\n- {sel}')
             except Exception:
                 pass
+
+        as_list.bind('<Double-Button-1>', add_text)
+        on_radio_change()
+
+    def close_work_popup(self, pop, ui_row_idx):
+        driver = self.work_drivers.pop(ui_row_idx, None)
+        try:
+            pop.destroy()
+        except Exception:
+            try:
+                pop.quit()
+            except Exception:
+                pass
+        self.write_system_log('업무 팝업 종료')
+
+        if not driver:
+            return
+
+        def _shutdown_driver():
+            for _dismiss in (True, False):
+                try:
+                    if _dismiss:
+                        driver.switch_to.alert.dismiss()
+                    else:
+                        driver.switch_to.alert.accept()
+                except Exception:
+                    pass
             try:
                 driver.quit()
             except Exception as e:
                 self.write_system_log(f'브라우저 종료 에러: {e}')
-            self.work_drivers.pop(ui_row_idx, None)
-        pop.destroy()
-        self.write_system_log('업무 팝업 종료')
+
+        threading.Thread(target=_shutdown_driver, daemon=True).start()
 
     # ──────────────────────────────────────────
     #  입학식 OT 팝업
     # ──────────────────────────────────────────
+    @staticmethod
+    def _is_ezview_running() -> bool:
+        """ezviewX 프로세스가 실행 중이면 True."""
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq ezviewX.exe', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=5
+            )
+            return 'ezviewX.exe' in result.stdout
+        except Exception:
+            return False
+
+    def _get_ezview_profile_dir(self) -> str:
+        root = os.environ.get('LOCALAPPDATA') or self.base_path
+        profile_dir = os.path.join(root, 'ARAONManagement', 'chrome-ezview-profile')
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
+    def _get_class_room_url(self) -> str:
+        return (
+            self.cfg.get('LMS', 'class_room_url', '').strip()
+            or self.cfg.get('LMS', 'admission_room_url', '').strip()
+        )
+
+    def _get_class_room_list_url(self) -> str:
+        room_url = self._get_class_room_url()
+        if not room_url:
+            return ''
+
+        try:
+            parsed = urlparse(room_url)
+            query = parse_qs(parsed.query)
+            class_cd = (query.get('class_cd') or [''])[0].strip()
+            year = (query.get('year') or [''])[0].strip()
+            if not class_cd:
+                return room_url
+
+            new_query = {'class_cd': class_cd}
+            if year:
+                new_query['year'] = year
+
+            return urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                '/wcms/onAirClass/onAirClassList.asp',
+                '',
+                urlencode(new_query),
+                '',
+            ))
+        except Exception:
+            return room_url
+
+    def _launch_ezview_bg(self):
+        """OT 팝업용: 입학식방 강사 버튼 클릭 → 권한창 Tab-Tab-Enter → ezviewX 실행."""
+        # 고정 URL: 개통/입학식 로직과 완전히 별개
+        LIST_URL = ('https://www.lmsone.com/wcms/onAirClass/'
+                    'onAirClassList.asp?class_cd=6101')
+        # 강사 버튼
+        BTN_XPATH = "//input[@type='button' and @name='강사' and @value='강사']"
+
+        driver = self._ezview_debug_driver
+        try:
+            lms_id, lms_pw = self.cfg.get_credentials()
+            if not lms_id or not lms_pw:
+                self.write_system_log('[ezviewX] LMS 계정 없음 — 건너뜀')
+                return
+
+            # 기존 드라이버 살아있으면 재사용, 죽었으면 새로 생성
+            if driver is not None:
+                try:
+                    _ = driver.current_window_handle
+                except Exception:
+                    SeleniumManager.safe_quit(driver)
+                    self._ezview_debug_driver = None
+                    driver = None
+
+            if driver is None:
+                self.write_system_log('[ezviewX] 브라우저 실행')
+                profile_dir = self._get_ezview_profile_dir()
+                driver = SeleniumManager.create_with_profile(profile_dir)
+                SeleniumManager.lms_login(driver, lms_id, lms_pw)
+                self._ezview_debug_driver = driver
+            else:
+                self.write_system_log('[ezviewX] 브라우저 재사용')
+
+            self.write_system_log(f'[ezviewX] 목록 페이지 이동: {LIST_URL}')
+            driver.get(LIST_URL)
+            driver.maximize_window()
+
+            wait = WebDriverWait(driver, 10)
+            btn = wait.until(EC.presence_of_element_located((By.XPATH, BTN_XPATH)))
+            driver.execute_script('arguments[0].click();', btn)
+            self.write_system_log('[ezviewX] 강사 버튼 클릭 완료')
+
+            # 로컬 네트워크 액세스 허용 다이얼로그: 1초 대기 후 Tab Tab Enter
+            time.sleep(1.0)
+            keyboard.press_and_release('tab')
+            time.sleep(0.15)
+            keyboard.press_and_release('tab')
+            time.sleep(0.15)
+            keyboard.press_and_release('enter')
+            self.write_system_log('[ezviewX] Tab Tab Enter 입력 완료')
+
+        except Exception as e:
+            self._ezview_debug_driver = None
+            self.write_system_log(f'[ezviewX] 실행 오류: {e}')
+
     def open_admission_popup(self, time_str: str):
         """입학식 시간 기준으로 해당 시간 학생 전체를 하나의 팝업으로 표시."""
         if not time_str or not time_str.strip():
@@ -2197,6 +2542,12 @@ class AraonWorkstation(ctk.CTk):
             messagebox.showwarning('알림', f'{time_str} 시간 학생이 없습니다.')
             return
 
+        # ezviewX 실행 여부 확인 → 꺼져 있으면 백그라운드에서 자동 실행
+        if not self._is_ezview_running():
+            threading.Thread(target=self._launch_ezview_bg, daemon=True).start()
+        else:
+            self.write_system_log('[ezviewX] 이미 실행 중')
+
         self.write_system_log(
             f'입학식 팝업: {time_str} ({len(students)}명) LMS 정보 로딩 중...'
         )
@@ -2213,7 +2564,8 @@ class AraonWorkstation(ctk.CTk):
         """각 학생 LMS 정보를 캐시 우선으로 수집 후 팝업 생성."""
         for s in students:
             name = s['name']
-            cached = self.lms_info_cache.get(name)
+            cache_key = _normalize_person_name(name)
+            cached = self.lms_info_cache.get(cache_key) or self.lms_info_cache.get(name)
             if cached:
                 s['lms_info'] = cached
             else:
@@ -2221,7 +2573,7 @@ class AraonWorkstation(ctk.CTk):
                 if driver:
                     info = self._extract_lms_info(driver, name)
                     SeleniumManager.safe_quit(driver)
-                    self.lms_info_cache[name] = info
+                    self.lms_info_cache[cache_key] = info
                     self._save_lms_cache()
                     s['lms_info'] = info
                 else:
@@ -2241,11 +2593,10 @@ class AraonWorkstation(ctk.CTk):
                 f'체크리스트 조회 결과: {list(all_checklists.keys()) or "없음"}'
             )
         except Exception as e:
-            import traceback
             self.write_system_log(f'체크리스트 조회 오류: {e}\n{traceback.format_exc()}')
 
         for s in students:
-            clean_name = s['name'].replace(' ', '').strip()
+            clean_name = _normalize_person_name(s['name'])
             s['sheet_data'] = all_checklists.get(clean_name)
             self.write_system_log(
                 f'  {s["name"]} → {"프리체크 있음" if s["sheet_data"] else "없음"}'
@@ -2302,26 +2653,37 @@ class AraonWorkstation(ctk.CTk):
 
     def _build_admission_popup_ui(self, students: list):
         time_str = students[0]['time_str'] if students else '-'
+        C = getattr(self, '_palette', {})
+        popup_font_size = 11
+        popup_font = ('Pretendard', popup_font_size)
+        popup_font_bold = ('Pretendard', popup_font_size, 'bold')
+
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        pop_w = min(screen_w - 180, 1120)
+        pop_h = min(screen_h - 220, 560)
+        pos_x = max(20, (screen_w - pop_w) // 2)
+        pos_y = max(20, (screen_h - pop_h) // 2)
 
         pop = ctk.CTkToplevel(self)
         pop.title(f'입학식 업무 처리 — {time_str} OT ({len(students)}명)')
-        pop.geometry('1020x780')
+        pop.geometry(f'{pop_w}x{pop_h}+{pos_x}+{pos_y}')
         pop.transient(self)
         pop.focus_force()
         pop.attributes('-topmost', self.cfg.getboolean('SETTINGS', 'popup_topmost', True))
+        pop.minsize(980, 460)
 
         # ── 헤더 ──
         ctk.CTkLabel(
             pop,
             text=f'🎓  {time_str} OT  —  총 {len(students)}명',
-            font=('Pretendard', 17, 'bold'), text_color='#f1c40f'
-        ).pack(pady=(15, 5))
+            font=('Pretendard', 17, 'bold'), text_color=C.get('brand', '#00a19b')
+        ).pack(pady=(10, 4))
 
         # ── 학생 카드 스크롤 영역 ──
-        scroll = ctk.CTkScrollableFrame(pop, fg_color='#1a1a1a')
-        scroll.pack(fill='both', expand=True, padx=15, pady=5)
+        scroll = ctk.CTkScrollableFrame(pop, fg_color=C.get('surface_hi', '#1f2628'))
+        scroll.pack(fill='both', expand=True, padx=12, pady=(2, 6))
 
-        today_str = f'{datetime.now().month}/{datetime.now().day}'
         student_vars_list = []
 
         # O/X 체크박스 항목
@@ -2340,89 +2702,148 @@ class AraonWorkstation(ctk.CTk):
 
         for s in students:
             lms = s.get('lms_info', {})
+            sheet_data = s.get('sheet_data')
 
-            card = ctk.CTkFrame(scroll, fg_color='#2b2b2b', corner_radius=8)
-            card.pack(fill='x', pady=5, padx=2)
-
-            # ── 정보 행 (LMS 저장 토글 포함) ──
-            info_row = ctk.CTkFrame(card, fg_color='transparent')
-            info_row.pack(fill='x', padx=12, pady=(12, 4))
-
+            card = ctk.CTkFrame(
+                scroll, fg_color=C.get('surface', '#171c1d'),
+                corner_radius=8, height=66
+            )
+            card.pack(fill='x', pady=2, padx=2)
+            card.pack_propagate(False)
             save_lms_v = ctk.BooleanVar(value=True)
-            ctk.CTkCheckBox(
-                info_row, text='', variable=save_lms_v,
-                width=24, checkbox_width=20, checkbox_height=20
-            ).pack(side='left', padx=(0, 4))
-            ctk.CTkLabel(
-                info_row,
-                text=f'👤 {s["name"]}',
-                font=('Pretendard', 14, 'bold'), text_color='#f1c40f'
-            ).pack(side='left')
-            ctk.CTkLabel(
-                info_row, text=f'  {s["grade"]}',
-                font=('Pretendard', 13)
-            ).pack(side='left')
-            ctk.CTkLabel(
-                info_row, text=f'  📱 {lms.get("hp", "-")}',
-                font=('Pretendard', 13)
-            ).pack(side='left')
-            ctk.CTkLabel(
-                info_row, text=f'  📞 {lms.get("p_hp", "-")}',
-                font=('Pretendard', 13)
-            ).pack(side='left')
             n_txt = s['n_col']
-            n_color = '#e74c3c' if n_txt else '#aaaaaa'
-            ctk.CTkLabel(
-                info_row, text=f'  📌 {n_txt}',
-                font=('Pretendard', 13, 'bold'), text_color=n_color
-            ).pack(side='left')
-            ctk.CTkLabel(
-                info_row, text='  ← LMS저장',
-                font=('Pretendard', 10), text_color='#888888'
-            ).pack(side='left')
+            stu_hp = lms.get('hp', '-') or '-'
+            parent_hp = lms.get('p_hp', '-') or '-'
+            note_target = '모에게/아이에게/부에게'
 
-            # ── 체크리스트 행 ──
-            cb_row = ctk.CTkFrame(card, fg_color='transparent')
-            cb_row.pack(fill='x', padx=12, pady=(0, 12))
+            top_row = ctk.CTkFrame(card, fg_color='transparent', height=26)
+            top_row.pack(fill='x', padx=8, pady=(2, 0))
+            top_row.pack_propagate(False)
+            bottom_row = ctk.CTkFrame(card, fg_color='transparent', height=28)
+            bottom_row.pack(fill='x', padx=8, pady=(0, 2))
+            bottom_row.pack_propagate(False)
 
-            sheet_data = s.get('sheet_data')  # None 또는 dict
+            def _chip(parent, label: str, value: str, *,
+                      value_color: str = '#f3f4f6', fill: bool = False):
+                chip = ctk.CTkFrame(parent, fg_color=C.get('chip', '#202729'), corner_radius=999)
+                chip.pack(side='left', padx=(0, 4), fill=('x' if fill else 'none'),
+                          expand=fill)
+                ctk.CTkLabel(
+                    chip, text=label, font=popup_font,
+                    text_color=C.get('text_dim', '#97a6aa')
+                ).pack(side='left', padx=(8, 3), pady=1)
+                ctk.CTkLabel(
+                    chip, text=value or '-', font=popup_font_bold,
+                    text_color=value_color
+                ).pack(side='left', padx=(0, 8), pady=1)
+                return chip
+
+            save_chip = ctk.CTkFrame(top_row, fg_color=C.get('chip_alt', '#273234'), corner_radius=999)
+            save_chip.pack(side='left', padx=(0, 4))
+            self._style_checkbox(ctk.CTkCheckBox(
+                save_chip, text='', variable=save_lms_v,
+                width=18, checkbox_width=14, checkbox_height=14
+            )).pack(side='left', padx=(8, 3), pady=1)
+            ctk.CTkLabel(
+                save_chip, text=f'{s["name"]} {s["grade"]}',
+                font=popup_font_bold, text_color=C.get('brand', '#00a19b')
+            ).pack(side='left', padx=(0, 8), pady=1)
+
+            _chip(top_row, '학생 폰', stu_hp)
+            _chip(top_row, '학부모 폰', parent_hp)
+            _chip(
+                top_row, note_target, n_txt or '-',
+                value_color=(C.get('danger', '#b56b5c') if n_txt else C.get('text_dim', '#97a6aa')),
+                fill=True
+            )
 
             sv = {'student': s, 'save_lms': save_lms_v, '_sheet_data': sheet_data}
 
-            # O/X 체크박스
+            def _field(parent, label: str, *, width: int | None = None,
+                       accent: bool = False):
+                field = ctk.CTkFrame(parent, fg_color=C.get('chip', '#202729'), corner_radius=10)
+                field.pack(side='left', padx=(0, 4))
+                ctk.CTkLabel(
+                    field, text=label, font=popup_font,
+                    text_color=(C.get('brand', '#00a19b') if accent else C.get('text_dim', '#97a6aa'))
+                ).pack(side='left', padx=(8, 4), pady=1)
+                body = ctk.CTkFrame(
+                    field,
+                    fg_color=C.get('surface_hi', '#F6F8FB'),
+                    border_width=1,
+                    border_color=C.get('border', '#D6DEE8'),
+                    corner_radius=8,
+                    width=width or 0,
+                    height=22,
+                )
+                body.pack(side='left', padx=(0, 8), pady=1)
+                if width:
+                    body.pack_propagate(False)
+                return body
+
+            time_body = _field(bottom_row, '입학식 시간', accent=True)
+            ctk.CTkLabel(
+                time_body, text=time_str, font=popup_font_bold,
+                text_color=C.get('brand', '#00a19b')
+            ).pack(side='left')
+
+            notice_body = _field(bottom_row, '입학식 안내문자', width=24)
+            kakao_body = _field(bottom_row, '카톡 등록', width=86)
+            level_body = _field(bottom_row, '레벨테스트', width=90)
+            note_body = _field(bottom_row, '노트', width=24)
+            first_class_body = _field(bottom_row, '첫 수업 일자', width=82)
+            form_body = _field(bottom_row, '폼 등록', width=24)
+            tt_send_body = _field(bottom_row, '전체시간표 발송', width=40)
+
+            hidden_bool_vars = {}
             for key, label in CHECKS_BOOL:
                 pre_checked = bool(
                     sheet_data and sheet_data.get(key, '').upper() == 'O'
                 )
                 var = ctk.BooleanVar(value=pre_checked)
                 sv[key] = var
-                ctk.CTkCheckBox(
-                    cb_row, text=label, variable=var, width=105
-                ).pack(side='left', padx=4)
+                if key == 'notice':
+                    self._style_checkbox(ctk.CTkCheckBox(
+                        notice_body, text='', variable=var,
+                        width=18, checkbox_width=14, checkbox_height=14
+                    )).pack(side='left', pady=1)
+                elif key == 'note':
+                    self._style_checkbox(ctk.CTkCheckBox(
+                        note_body, text='', variable=var,
+                        width=18, checkbox_width=14, checkbox_height=14
+                    )).pack(side='left', pady=1)
+                elif key == 'form':
+                    self._style_checkbox(ctk.CTkCheckBox(
+                        form_body, text='', variable=var,
+                        width=18, checkbox_width=14, checkbox_height=14
+                    )).pack(side='left', pady=1)
+                elif key == 'tt_send':
+                    self._style_checkbox(ctk.CTkCheckBox(
+                        tt_send_body, text='', variable=var,
+                        width=18, checkbox_width=14, checkbox_height=14
+                    )).pack(side='left', pady=1)
+                else:
+                    hidden_bool_vars[key] = var
 
-            # 드롭다운 (카톡등록, 레벨테스트)
             for key, label, opts in CHECKS_DROPDOWN:
                 raw = (sheet_data.get(key, '') if sheet_data else '').strip()
                 pre_val = raw if raw in opts else ' '
-                ctk.CTkLabel(
-                    cb_row, text=f' {label}:', font=('Pretendard', 12)
-                ).pack(side='left', padx=(6, 2))
                 str_var = ctk.StringVar(value=pre_val)
                 sv[key] = str_var
+                target = kakao_body if key == 'kakao' else level_body
+                width = 86 if key == 'kakao' else 90
                 ctk.CTkOptionMenu(
-                    cb_row, variable=str_var, values=opts,
-                    width=90, height=28, font=('Pretendard', 12),
-                    fg_color='#374151', button_color='#4b5563',
-                    button_hover_color='#6b7280',
-                ).pack(side='left', padx=2)
+                    target, variable=str_var, values=opts,
+                    width=width, height=24, font=popup_font,
+                    fg_color=C.get('surface_lo', '#334155'),
+                    button_color=C.get('secondary', '#475569'),
+                    button_hover_color=C.get('secondary_hv', '#64748b'),
+                    text_color=C.get('text', '#eef2f3'),
+                ).pack(side='left')
 
-            # 첫 수업 일자 — 달력 버튼 (기본값 공백, 클릭 시 달력으로 선택)
             fc_default = ''
             if sheet_data and sheet_data.get('first_class', '').strip():
                 fc_default = sheet_data['first_class'].strip()
-            ctk.CTkLabel(
-                cb_row, text=' 첫수업:', font=('Pretendard', 12)
-            ).pack(side='left', padx=(10, 2))
             first_class_v = ctk.StringVar(value=fc_default)
             sv['first_class'] = first_class_v
 
@@ -2446,24 +2867,30 @@ class AraonWorkstation(ctk.CTk):
                 ctk.CTkButton(btn_row, text='선택', width=80,
                               command=_pick).pack(side='left', padx=4)
                 ctk.CTkButton(btn_row, text='지우기', width=80,
-                              fg_color='#7f8c8d',
-                              command=lambda: (var.set(''),
-                                               cal_win.destroy())
+                              fg_color=C.get('secondary', '#7f8c8d'),
+                              hover_color=C.get('secondary_hv', '#6b7280'),
+                               command=lambda: (var.set(''),
+                                                cal_win.destroy())
                               ).pack(side='left', padx=4)
 
-            fc_btn = ctk.CTkButton(
-                cb_row, textvariable=first_class_v,
-                width=65, height=28, font=('Pretendard', 12),
-                fg_color='#34495e', hover_color='#2c3e50',
+            ctk.CTkButton(
+                first_class_body, textvariable=first_class_v,
+                width=82, height=24, font=popup_font,
+                fg_color=C.get('brand', '#00a19b'),
+                hover_color=C.get('brand_hv', '#007f7a'),
+                text_color=C.get('text_on_brand', '#ffffff'),
                 command=_open_fc_calendar,
-            )
-            fc_btn.pack(side='left')
+            ).pack(side='left')
+
+            # 현재 UI에는 노출하지 않지만 기존 저장 흐름은 유지한다.
+            if 'schedule' in hidden_bool_vars:
+                sv['schedule'] = hidden_bool_vars['schedule']
 
             student_vars_list.append(sv)
 
         # ── 상태 레이블 ──
         status_lbl = ctk.CTkLabel(
-            pop, text='', font=('Pretendard', 12), text_color='#2ecc71'
+            pop, text='', font=('Pretendard', 12), text_color=C.get('success', '#2f8f6b')
         )
         status_lbl.pack(pady=(4, 0))
 
@@ -2648,11 +3075,13 @@ class AraonWorkstation(ctk.CTk):
 
         save_btn = ctk.CTkButton(
             pop, text='LMS 저장 및 완료',
-            font=('Pretendard', 14, 'bold'), height=46,
-            fg_color='#1a7a4a', hover_color='#145c38',
+            font=('Pretendard', 13, 'bold'), height=40,
+            fg_color=C.get('brand', '#00a19b'),
+            hover_color=C.get('brand_hv', '#007f7a'),
+            text_color=C.get('text_on_brand', '#ffffff'),
             command=save_all
         )
-        save_btn.pack(pady=(5, 15), padx=20, fill='x')
+        save_btn.pack(pady=(4, 10), padx=16, fill='x')
 
     # ──────────────────────────────────────────
     #  개별 강의 배정
@@ -2876,21 +3305,81 @@ class AraonWorkstation(ctk.CTk):
         except Exception:
             pass
 
-    def _patch_toplevel_icon(self):
-        """ctk.CTkToplevel 생성 시 자동으로 아이콘 적용하도록 monkey patch."""
-        icon_path = self._icon_path
-        if not icon_path:
+    def _promote_popup(self, win):
+        """새로 연 팝업이 기존 팝업보다 위로 오도록 한 번 승격."""
+        keep_topmost = False
+        try:
+            if not win.winfo_exists():
+                return
+            win.update_idletasks()
+            keep_topmost = bool(win.attributes('-topmost'))
+        except Exception:
+            keep_topmost = False
+
+        try:
+            win.deiconify()
+        except Exception:
+            pass
+
+        try:
+            win.lift()
+            win.focus_force()
+            win.attributes('-topmost', True)
+            win.lift()
+        except Exception:
             return
+
+        if keep_topmost:
+            return
+
+        def _restore():
+            try:
+                if not win.winfo_exists():
+                    return
+                win.attributes('-topmost', False)
+                win.lift()
+                win.focus_force()
+            except Exception:
+                pass
+
+        try:
+            win.after(180, _restore)
+        except Exception:
+            pass
+
+    def _patch_toplevel_icon(self):
+        """ctk.CTkToplevel 생성 시 아이콘과 초기 z-order를 공통 적용."""
+        if getattr(ctk.CTkToplevel.__init__, '_araon_popup_patch', False):
+            return
+
+        icon_path = self._icon_path
         orig_init = ctk.CTkToplevel.__init__
 
         def patched(self_, *args, **kwargs):
             orig_init(self_, *args, **kwargs)
-            try:
-                # tk 가 윈도우를 실제로 만든 뒤 iconbitmap 호출해야 적용됨
-                self_.after(100, lambda: self_.iconbitmap(icon_path))
-            except Exception:
-                pass
 
+            def _finish_setup():
+                try:
+                    if icon_path and self_.winfo_exists():
+                        self_.iconbitmap(icon_path)
+                except Exception:
+                    pass
+
+                try:
+                    owner = self_.master
+                    while owner is not None and not hasattr(owner, '_promote_popup'):
+                        owner = getattr(owner, 'master', None)
+                    if owner is not None:
+                        owner._promote_popup(self_)
+                except Exception:
+                    pass
+
+            try:
+                self_.after_idle(_finish_setup)
+            except Exception:
+                _finish_setup()
+
+        patched._araon_popup_patch = True
         ctk.CTkToplevel.__init__ = patched
 
     # ──────────────────────────────────────────
@@ -2949,8 +3438,7 @@ class AraonWorkstation(ctk.CTk):
 
         pop = ctk.CTkToplevel(self)
         pop.title('시간표 배정')
-        pop.geometry('1360x960')
-        pop.minsize(1240, 880)
+        C = self._style_popup(pop, '1480x900', minsize=(1320, 800))
         pop.transient(self)
         pop.focus_force()
 
@@ -2987,11 +3475,17 @@ class AraonWorkstation(ctk.CTk):
         outer = ctk.CTkFrame(pop, fg_color='transparent')
         outer.pack(fill='both', expand=True, padx=10, pady=10)
 
-        left_panel = ctk.CTkFrame(outer, width=400)
+        left_panel = ctk.CTkFrame(
+            outer, width=300, fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=16, border_width=1, border_color=C.get('border', '#D6DEE8')
+        )
         left_panel.pack(side='left', fill='y', padx=(0, 10))
         left_panel.pack_propagate(False)
 
-        right_panel = ctk.CTkFrame(outer)
+        right_panel = ctk.CTkFrame(
+            outer, fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=16, border_width=1, border_color=C.get('border', '#D6DEE8')
+        )
         right_panel.pack(side='right', fill='both', expand=True)
 
         # 왼쪽 하단(버튼) / 위쪽(스크롤 콘텐츠) 분리
@@ -3003,7 +3497,7 @@ class AraonWorkstation(ctk.CTk):
         ctk.CTkLabel(content_panel, text='시간표 배정 도우미',
                      font=('Pretendard', 17, 'bold')).pack(anchor='w', pady=(0, 2))
         ctk.CTkLabel(content_panel, text='학생 검색 → LMS 현재 시간표 로드 → 수정 → 배정',
-                     font=('Pretendard', 11), text_color='#888888').pack(anchor='w', pady=(0, 10))
+                     font=('Pretendard', 11), text_color=C.get('text_dim', '#667085')).pack(anchor='w', pady=(0, 10))
 
         # 1. 학생 검색
         ctk.CTkLabel(content_panel, text='1. LMS 학생 검색',
@@ -3015,17 +3509,21 @@ class AraonWorkstation(ctk.CTk):
         btn_search = ctk.CTkButton(search_row, text='LMS 검색', width=90, height=32,
                                    fg_color='#1f538d', hover_color='#1a4573')
         btn_search.pack(side='right')
+        self._style_entry(e_search)
+        e_search.configure(height=34)
+        btn_search.configure(**self._button_theme('primary'), width=96, height=34)
 
         search_status = ctk.CTkLabel(content_panel, text='',
-                                     font=('Pretendard', 11), text_color='#888888')
+                                     font=('Pretendard', 11), text_color=C.get('text_dim', '#667085'))
         search_status.pack(anchor='w', pady=(0, 4))
 
         result_scroll = ctk.CTkScrollableFrame(content_panel, width=360, height=140)
         result_scroll.pack(fill='x', pady=(0, 10))
+        result_scroll.configure(fg_color=C.get('surface_hi', '#F6F8FB'))
 
         selected_label = ctk.CTkLabel(content_panel, text='선택된 학생: 없음',
                                       font=('Pretendard', 12, 'bold'),
-                                      text_color='#3b82f6')
+                                      text_color=C.get('brand', '#0145F2'))
         selected_label.pack(anchor='w', pady=(0, 10))
 
         # 2. 학년 선택
@@ -3043,40 +3541,47 @@ class AraonWorkstation(ctk.CTk):
             width=180,
         )
         grade_menu.pack(anchor='w', pady=(0, 10))
+        self._style_optionmenu(grade_menu)
 
         # 3. 과목 선택
         ctk.CTkLabel(content_panel, text='3. 과목 선택',
                      font=('Pretendard', 14, 'bold')).pack(anchor='w', pady=(4, 4))
         sub_frame = ctk.CTkScrollableFrame(content_panel, width=360, height=240)
         sub_frame.pack(fill='x', pady=(0, 10))
+        sub_frame.configure(fg_color=C.get('surface_hi', '#F6F8FB'))
 
         # 오른쪽: 안내 + 그리드 + 로그
-        info_box = ctk.CTkFrame(right_panel, fg_color='#111827', corner_radius=8)
+        info_box = ctk.CTkFrame(
+            right_panel, fg_color=C.get('header_band', '#EAF0FF'),
+            corner_radius=12, border_width=1, border_color=C.get('border', '#D6DEE8')
+        )
         info_box.pack(fill='x', padx=10, pady=(10, 6))
         ctk.CTkLabel(info_box, text='4. 오른쪽 시간표에서 최종 배정 칸을 클릭',
                      font=('Pretendard', 14, 'bold')).pack(anchor='w', padx=12, pady=(10, 2))
         info_label = ctk.CTkLabel(info_box,
                                   text='학생을 선택하면 LMS 현재 시간표를 먼저 불러옵니다.',
                                   font=('Pretendard', 11),
-                                  text_color='#9ca3af')
+                                  text_color=C.get('text_dim', '#667085'))
         info_label.pack(anchor='w', padx=12, pady=(0, 10))
 
-        table_wrap = ctk.CTkScrollableFrame(right_panel, fg_color='#1a1a1a')
+        table_wrap = ctk.CTkScrollableFrame(right_panel, fg_color=C.get('surface_hi', '#F6F8FB'))
         table_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
 
         # 그리드에 정말 배치 못 하는 잔여 엔트리만 표시 (예: 요일/시간 파싱 실패)
-        off_grid_wrap = ctk.CTkFrame(right_panel, fg_color='#1a1a1a')
-        off_grid_wrap.pack(fill='x', padx=10, pady=(0, 6))
+        # 항목이 없을 때는 pack하지 않아 공간을 차지하지 않음
+        off_grid_wrap = ctk.CTkFrame(
+            right_panel, fg_color=C.get('surface_hi', '#F6F8FB'),
+            corner_radius=12, border_width=1, border_color=C.get('border', '#D6DEE8')
+        )
         off_grid_label = ctk.CTkLabel(off_grid_wrap,
-                                      text='📌 미배치 엔트리: 없음',
+                                      text='📌 미배치 엔트리 — 클릭해 삭제표시',
                                       font=('Pretendard', 11, 'bold'),
-                                      text_color='#9ca3af')
+                                      text_color=C.get('text', '#18212F'))
         off_grid_label.pack(anchor='w', padx=8, pady=(6, 2))
         off_grid_row = ctk.CTkFrame(off_grid_wrap, fg_color='transparent')
         off_grid_row.pack(fill='x', padx=8, pady=(0, 6))
 
-        log_box = ctk.CTkTextbox(right_panel, height=140, fg_color='#0f172a',
-                                 text_color='#e2e8f0')
+        log_box = self._style_textbox(ctk.CTkTextbox(right_panel, height=140))
         log_box.pack(fill='x', padx=10, pady=(0, 10))
 
         def write_log(msg: str):
@@ -3093,16 +3598,24 @@ class AraonWorkstation(ctk.CTk):
                 ctk.CTkLabel(
                     table_wrap, text=day,
                     font=('Pretendard', 13, 'bold'),
-                    width=140, fg_color='#333333'
+                    width=140, fg_color=C.get('header_band_alt', '#E4ECFF'),
+                    text_color=C.get('text', '#18212F'),
+                    corner_radius=8
                 ).grid(row=0, column=j, padx=1, pady=1, sticky='nsew')
             for i, ts in enumerate(base_times):
                 ctk.CTkLabel(
-                    table_wrap, text=ts, width=80, fg_color='#2b2b2b'
+                    table_wrap, text=ts, width=80,
+                    fg_color=C.get('surface_lo', '#E1E8F0'),
+                    text_color=C.get('text', '#18212F'),
+                    corner_radius=8
                 ).grid(row=i + 1, column=0, padx=1, pady=1)
                 for j, day in enumerate(days):
                     btn = ctk.CTkButton(
                         table_wrap, text='', width=140, height=44,
-                        fg_color='#111111', font=('Pretendard', 11),
+                        fg_color=C.get('surface', '#FFFFFF'),
+                        hover_color=C.get('surface_lo', '#E1E8F0'),
+                        text_color=C.get('text', '#18212F'),
+                        corner_radius=8, font=('Pretendard', 11),
                         state='disabled'
                     )
                     btn.grid(row=i + 1, column=j + 1, padx=1, pady=1)
@@ -3157,22 +3670,22 @@ class AraonWorkstation(ctk.CTk):
                 w.destroy()
             off = tt_state.get('off_grid_entries', []) or []
             if not off:
-                off_grid_label.configure(
-                    text='📌 미배치 엔트리: 없음',
-                    text_color='#9ca3af')
+                # 항목 없으면 프레임 자체를 숨김 → 시간표 그리드가 더 넓어짐
+                off_grid_wrap.pack_forget()
                 return
+            # 항목 있을 때만 표시
+            off_grid_wrap.pack(fill='x', padx=10, pady=(0, 6),
+                               before=log_box)
             off_grid_label.configure(
-                text=f'📌 미배치 엔트리 — 클릭해 삭제표시 ({len(off)}건)',
-                text_color='#e5e7eb')
+                text=f'📌 미배치 엔트리 — 클릭해 삭제표시 ({len(off)}건)')
             for ent in off:
                 pending = is_pending_delete(ent)
                 label = f"{ent.get('subject','')} | {ent.get('day','')} {ent.get('time','')}"
                 if pending:
                     label = '🗑 ' + label
-                btn = ctk.CTkButton(
+                btn = self._make_button(
                     off_grid_row, text=label, height=28,
-                    fg_color=('#991b1b' if pending else '#4b5563'),
-                    hover_color=('#7f1d1d' if pending else '#374151'),
+                    variant=('danger' if pending else 'secondary'),
                     font=('Pretendard', 11),
                     command=lambda e=ent: (toggle_pending_delete(e), render_off_grid()),
                 )
@@ -3212,14 +3725,20 @@ class AraonWorkstation(ctk.CTk):
                     btn = grid_cells[key]
                     unmanaged = tt_state.get('unmanaged_by_cell', {}).get(key)
                     if key in final_selection:
+                        # 선택됨 → 진파랑
                         btn.configure(
                             text=final_selection[key], state='normal',
-                            fg_color='#e67e22', hover_color='#d35400',
+                            fg_color='#0145F2',
+                            hover_color='#0136BD',
+                            text_color='#FFFFFF',
                         )
                     elif matches:
+                        # 배정 가능하지만 미선택 → 연파랑
                         btn.configure(
                             text='\n'.join(matches), state='normal',
-                            fg_color='#1f538d', hover_color='#1a4573',
+                            fg_color='#BFDBFE',
+                            hover_color='#93C5FD',
+                            text_color='#1E3A8A',
                         )
                     elif unmanaged:
                         pending = is_pending_delete(unmanaged)
@@ -3227,17 +3746,23 @@ class AraonWorkstation(ctk.CTk):
                         if pending:
                             btn.configure(
                                 text='🗑 ' + subj, state='normal',
-                                fg_color='#991b1b', hover_color='#7f1d1d',
+                                fg_color=C.get('danger', '#D14343'),
+                                hover_color=C.get('danger_hv', '#B73636'),
+                                text_color=C.get('text_on_brand', '#FFFFFF'),
                             )
                         else:
                             btn.configure(
                                 text=subj, state='normal',
-                                fg_color='#4b5563', hover_color='#374151',
+                                fg_color=C.get('secondary', '#76839A'),
+                                hover_color=C.get('secondary_hv', '#5E6A80'),
+                                text_color=C.get('text_on_secondary', '#FFFFFF'),
                             )
                     else:
                         btn.configure(
                             text='', state='disabled',
-                            fg_color='#111111', hover_color='#111111',
+                            fg_color=C.get('surface', '#FFFFFF'),
+                            hover_color=C.get('surface_lo', '#E1E8F0'),
+                            text_color=C.get('text', '#18212F'),
                         )
 
         def click_cell(day: str, ts: str):
@@ -3282,14 +3807,14 @@ class AraonWorkstation(ctk.CTk):
             # 여러 후보 → 선택 팝업
             menu = ctk.CTkToplevel(pop)
             menu.title('과목 선택')
-            menu.geometry('220x260')
+            self._style_popup(menu, '240x280', minsize=(220, 240))
             menu.transient(pop)
             menu.focus_force()
             ctk.CTkLabel(menu, text='배정할 과목 선택',
                          font=('Pretendard', 13, 'bold')).pack(pady=10)
             for m in matches:
-                ctk.CTkButton(
-                    menu, text=m,
+                self._make_button(
+                    menu, text=m, variant='ghost',
                     command=lambda val=m: [
                         final_selection.update({key: val}),
                         menu.destroy(),
@@ -3383,9 +3908,9 @@ class AraonWorkstation(ctk.CTk):
             keyword = e_search.get().strip()
             if not keyword:
                 search_status.configure(text='학생 이름을 입력해주세요.',
-                                        text_color='#ef4444')
+                                        text_color=C.get('danger', '#D14343'))
                 return
-            search_status.configure(text='LMS 검색 중...', text_color='#3b82f6')
+            search_status.configure(text='LMS 검색 중...', text_color=C.get('brand', '#0145F2'))
             btn_search.configure(state='disabled')
 
             def _work():
@@ -3394,7 +3919,7 @@ class AraonWorkstation(ctk.CTk):
                     if not driver:
                         pop.after(0, lambda: (
                             search_status.configure(text='LMS 로그인 실패',
-                                                    text_color='#ef4444'),
+                                                    text_color=C.get('danger', '#D14343')),
                             btn_search.configure(state='normal'),
                         ))
                         return
@@ -3402,7 +3927,7 @@ class AraonWorkstation(ctk.CTk):
                 except Exception as e:
                     pop.after(0, lambda err=e: (
                         search_status.configure(text=f'검색 오류: {err}',
-                                                text_color='#ef4444'),
+                                                text_color=C.get('danger', '#D14343')),
                         btn_search.configure(state='normal'),
                     ))
                     return
@@ -3413,10 +3938,10 @@ class AraonWorkstation(ctk.CTk):
                     if results:
                         search_status.configure(
                             text=f'{len(results)}명 검색됨. 학생을 누르면 시간표를 불러옵니다.',
-                            text_color='#9ca3af')
+                            text_color=C.get('text_dim', '#667085'))
                     else:
                         search_status.configure(text='검색 결과 없음',
-                                                text_color='#ef4444')
+                                                text_color=C.get('danger', '#D14343'))
                     btn_search.configure(state='normal')
                     if len(results) == 1:
                         load_target(results[0])
@@ -3426,6 +3951,7 @@ class AraonWorkstation(ctk.CTk):
 
         btn_search.configure(command=do_search)
         e_search.bind('<Return>', lambda _e: do_search())
+        e_search.bind('<KP_Enter>', lambda _e: do_search())
 
         # ── 학생 선택 → 현재 시간표 로드 ───────────────────────
         def _normalize_grade(raw: str) -> str:
@@ -3444,7 +3970,7 @@ class AraonWorkstation(ctk.CTk):
             if not target.get('member_id') or not target.get('member_seq'):
                 search_status.configure(
                     text='이 학생은 LMS member_id/member_seq 정보가 없습니다.',
-                    text_color='#ef4444')
+                    text_color=C.get('danger', '#D14343'))
                 return
 
             # ── 검색 결과에 이미 학년이 있으면 즉시 적용 (LMS fetch 대기 없이) ──
@@ -3456,22 +3982,22 @@ class AraonWorkstation(ctk.CTk):
                     update_subject_list()
 
             info_label.configure(text='LMS 현재 시간표를 읽는 중입니다...',
-                                 text_color='#9ca3af')
-            search_status.configure(text='시간표 불러오는 중...', text_color='#3b82f6')
+                                 text_color=C.get('text_dim', '#667085'))
+            search_status.configure(text='시간표 불러오는 중...', text_color=C.get('brand', '#0145F2'))
 
             def _work():
                 try:
                     driver = self._tt_ensure_driver(tt_state, write_log)
                     if not driver:
                         pop.after(0, lambda: info_label.configure(
-                            text='LMS 드라이버 생성 실패', text_color='#ef4444'))
+                            text='LMS 드라이버 생성 실패', text_color=C.get('danger', '#D14343')))
                         return
                     ok, payload = self._tt_fetch_current_timetable(
                         driver, target['member_id'], target['member_seq'], write_log
                     )
                 except Exception as e:
                     pop.after(0, lambda err=e: info_label.configure(
-                        text=f'시간표 불러오기 오류: {err}', text_color='#ef4444'))
+                        text=f'시간표 불러오기 오류: {err}', text_color=C.get('danger', '#D14343')))
                     return
 
                 def _done():
@@ -3530,10 +4056,10 @@ class AraonWorkstation(ctk.CTk):
                     search_status.configure(
                         text=f"{payload.get('name', target.get('name', ''))} 시간표 "
                              f"{len(payload.get('entries', []))}건 로드됨",
-                        text_color='#10b981')
+                        text_color=C.get('success', '#0E9F6E'))
                     info_label.configure(
                         text='주황색은 저장될 칸입니다. 과목 체크를 바꾸거나 칸을 눌러 수정하세요.',
-                        text_color='#9ca3af')
+                        text_color=C.get('text_dim', '#667085'))
                 pop.after(0, _done)
 
             threading.Thread(target=_work, daemon=True).start()
@@ -3699,29 +4225,24 @@ class AraonWorkstation(ctk.CTk):
 
         btn_row1 = ctk.CTkFrame(footer_panel, fg_color='transparent')
         btn_row1.pack(fill='x', pady=2)
-        ctk.CTkButton(btn_row1, text='🔄 선택 초기화', height=34,
-                      fg_color='#6b7280', hover_color='#4b5563',
+        self._make_button(btn_row1, text='🔄 선택 초기화', variant='secondary', height=34,
                       command=lambda: (final_selection.clear(), update_timetable_view())
                       ).pack(side='left', fill='x', expand=True, padx=(0, 3))
-        btn_assign = ctk.CTkButton(
-            btn_row1, text='👨‍🏫 시간표 배정', height=34,
-            fg_color='#8e44ad', hover_color='#732d91',
+        btn_assign = self._make_button(
+            btn_row1, text='👨‍🏫 시간표 배정', variant='primary', height=34,
             command=do_assign
         )
         btn_assign.pack(side='left', fill='x', expand=True, padx=(3, 0))
 
         btn_row2 = ctk.CTkFrame(footer_panel, fg_color='transparent')
         btn_row2.pack(fill='x', pady=2)
-        ctk.CTkButton(btn_row2, text='👀 시간표 보기', height=34,
-                      fg_color='#f39c12', hover_color='#d68910',
+        self._make_button(btn_row2, text='시간표 보기', variant='ghost', height=34,
                       command=do_view
                       ).pack(side='left', fill='x', expand=True, padx=(0, 3))
-        ctk.CTkButton(btn_row2, text='📋 칸 복사', height=34,
-                      fg_color='#27ae60', hover_color='#1e8449',
+        self._make_button(btn_row2, text='칸 복사', variant='secondary', height=34,
                       command=copy_subject_timetable
                       ).pack(side='left', fill='x', expand=True, padx=(3, 3))
-        ctk.CTkButton(btn_row2, text='📝 전체 복사', height=34,
-                      fg_color='#2980b9', hover_color='#1f618d',
+        self._make_button(btn_row2, text='전체 복사', variant='secondary', height=34,
                       command=copy_full_timetable
                       ).pack(side='left', fill='x', expand=True, padx=(3, 0))
 
@@ -3765,7 +4286,8 @@ class AraonWorkstation(ctk.CTk):
             return None
         try:
             log_cb('LMS 드라이버 생성 중...')
-            drv = SeleniumManager.create_incognito()
+            # background=True: Chrome 창을 화면 뒤/최소화 상태로 시작 → 프로그램을 가리지 않음
+            drv = SeleniumManager.create_incognito(background=True)
             SeleniumManager.lms_login(drv, lms_id, lms_pw)
             tt_state['driver'] = drv
             log_cb('LMS 드라이버 준비 완료')
@@ -4180,10 +4702,20 @@ class AraonWorkstation(ctk.CTk):
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
                     ).click()
 
-                    checkbox = WebDriverWait(driver, 4).until(
-                        EC.presence_of_element_located((By.NAME, 'onair_seqs'))
-                    )
-                    driver.execute_script('arguments[0].click();', checkbox)
+                    # 검색 후 AJAX 갱신 대기 — 노드가 DOM에 안착할 때까지 재시도
+                    checkbox = None
+                    for _attempt in range(3):
+                        try:
+                            time.sleep(0.4)
+                            checkbox = WebDriverWait(driver, 5).until(
+                                EC.presence_of_element_located((By.NAME, 'onair_seqs'))
+                            )
+                            driver.execute_script('arguments[0].click();', checkbox)
+                            break
+                        except Exception:
+                            checkbox = None
+                    if checkbox is None:
+                        raise RuntimeError('checkbox 클릭 실패 (3회 재시도)')
 
                     driver.find_element(
                         By.XPATH,
@@ -4225,10 +4757,19 @@ class AraonWorkstation(ctk.CTk):
                         By.XPATH,
                         "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
                     ).click()
-                    checkbox = WebDriverWait(driver, 4).until(
-                        EC.presence_of_element_located((By.NAME, 'onair_seqs'))
-                    )
-                    driver.execute_script('arguments[0].click();', checkbox)
+                    checkbox = None
+                    for _attempt in range(3):
+                        try:
+                            time.sleep(0.4)
+                            checkbox = WebDriverWait(driver, 5).until(
+                                EC.presence_of_element_located((By.NAME, 'onair_seqs'))
+                            )
+                            driver.execute_script('arguments[0].click();', checkbox)
+                            break
+                        except Exception:
+                            checkbox = None
+                    if checkbox is None:
+                        raise RuntimeError('checkbox 클릭 실패 (3회 재시도)')
                     driver.find_element(
                         By.XPATH,
                         "//input[@type='button' and @value='방송수업개별배정']"
@@ -4253,6 +4794,11 @@ class AraonWorkstation(ctk.CTk):
                            name: str, log_cb):
         """상세 페이지로 이동해 pro_tab4(시간표 조회) 창을 연다."""
         try:
+            # 시간표 조회는 화면에 보여야 하므로 최소화된 창을 복원
+            try:
+                driver.maximize_window()
+            except Exception:
+                pass
             detail_url = (
                 'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
                 f'?mode=U&member_id={member_id}&member_seq={member_seq}'
@@ -4882,7 +5428,7 @@ class AraonWorkstation(ctk.CTk):
     def open_calendar(self):
         win = ctk.CTkToplevel(self)
         win.title('날짜 선택')
-        win.geometry('300x350')
+        C = self._style_popup(win, '320x380', minsize=(300, 340))
         win.transient(self)
         win.focus_force()
         cal = Calendar(win, selectmode='day', locale='ko_KR')
@@ -4895,7 +5441,7 @@ class AraonWorkstation(ctk.CTk):
             win.destroy()
             self.load_sheet_data_async()
 
-        ctk.CTkButton(win, text='데이터 불러오기', command=sel).pack(pady=10)
+        self._make_button(win, text='날짜 적용', variant='primary', command=sel).pack(pady=10)
 
     def _show_patch_notes(self):
         """GitHub 최신 릴리즈 패치노트를 팝업으로 표시."""
@@ -4904,7 +5450,7 @@ class AraonWorkstation(ctk.CTk):
 
         pop = ctk.CTkToplevel(self)
         pop.title('패치노트')
-        pop.geometry('500x420')
+        C = self._style_popup(pop, '540x460', minsize=(440, 360))
         pop.resizable(True, True)
         pop.transient(self)
         pop.focus_force()
@@ -4937,7 +5483,10 @@ class AraonWorkstation(ctk.CTk):
                 font=('Pretendard', 14, 'bold'),
             ).pack(pady=(16, 6))
 
-            txt_frame = ctk.CTkFrame(pop, fg_color='#1e293b', corner_radius=8)
+            txt_frame = ctk.CTkFrame(
+                pop, fg_color=C.get('surface', '#FFFFFF'),
+                corner_radius=12, border_width=1, border_color=C.get('border', '#D6DEE8')
+            )
             txt_frame.pack(fill='both', expand=True, padx=16, pady=(0, 16))
 
             scrollbar = tk.Scrollbar(txt_frame)
@@ -4945,7 +5494,7 @@ class AraonWorkstation(ctk.CTk):
 
             txt = tk.Text(
                 txt_frame,
-                bg='#1e293b', fg='#cbd5e1',
+                bg=C.get('surface', '#FFFFFF'), fg=C.get('text', '#18212F'),
                 font=('맑은 고딕', 9),
                 wrap='word', relief='flat', bd=0,
                 padx=10, pady=8,
@@ -4962,7 +5511,7 @@ class AraonWorkstation(ctk.CTk):
     def open_settings_menu(self):
         pop = ctk.CTkToplevel(self)
         pop.title('환경 설정')
-        pop.geometry('350x420')
+        C = self._style_popup(pop, '380x440', minsize=(340, 400))
         pop.transient(self)
         pop.focus_force()
 
@@ -4973,13 +5522,13 @@ class AraonWorkstation(ctk.CTk):
             ('🔑 LMS 계정 설정', self.popup_accounts),
             ('🎓 수업방 URL 설정', self.popup_class_room),
         ]:
-            ctk.CTkButton(pop, text=label, height=45, command=cmd
-                          ).pack(fill='x', padx=30, pady=8)
+            self._make_button(pop, text=label, variant='ghost', height=45, command=cmd
+                              ).pack(fill='x', padx=30, pady=8)
 
     def popup_as_templates(self):
         pop = ctk.CTkToplevel(self)
         pop.title('AS 상용구 관리')
-        pop.geometry('400x450')
+        C = self._style_popup(pop, '430x480', minsize=(380, 420))
         pop.transient(self)
         pop.focus_force()
 
@@ -4987,7 +5536,7 @@ class AraonWorkstation(ctk.CTk):
             pop, text='상용구를 줄바꿈으로 구분하여 입력하세요.',
             font=('Pretendard', 12)
         ).pack(pady=10)
-        txt = ctk.CTkTextbox(pop, width=350, height=300)
+        txt = self._style_textbox(ctk.CTkTextbox(pop, width=350, height=300))
         txt.pack(pady=5)
         current = self.cfg.get('AS_TEMPLATES', 'list', '장비교체 완료,현장점검 완료')
         txt.insert('1.0', current.replace(',', '\n'))
@@ -5003,17 +5552,17 @@ class AraonWorkstation(ctk.CTk):
             except Exception as e:
                 messagebox.showerror('저장 오류', f'{e}')
 
-        ctk.CTkButton(pop, text='저장', command=save).pack(pady=15)
+        self._make_button(pop, text='저장', variant='primary', command=save).pack(pady=15)
 
     def popup_hotkey_theme(self):
         pop = ctk.CTkToplevel(self)
         pop.title('카카오톡 및 테마')
-        pop.geometry('420x640')
+        C = self._style_popup(pop, '440x660', minsize=(400, 620))
         pop.transient(self)
         pop.focus_force()
 
         ctk.CTkLabel(pop, text='카톡 단축키 (ex: F4)').pack(pady=(15, 5))
-        e = ctk.CTkEntry(pop)
+        e = self._style_entry(ctk.CTkEntry(pop))
         e.insert(0, self.cfg.get('SETTINGS', 'hotkey', 'F4'))
         e.pack(pady=5)
 
@@ -5026,7 +5575,7 @@ class AraonWorkstation(ctk.CTk):
         # ── 카톡 매크로 모드 + 좌표 캡처 ───────────────────────
         ctk.CTkLabel(pop, text='─── 카톡 매크로 ───',
                      font=('Pretendard', 11, 'bold'),
-                     text_color='#94a3b8').pack(pady=(14, 4))
+                     text_color=C.get('text_dim', '#667085')).pack(pady=(14, 4))
 
         mode_var = ctk.StringVar(
             value=self.cfg.get('SETTINGS', 'kakao_macro_mode', 'coords')
@@ -5040,7 +5589,7 @@ class AraonWorkstation(ctk.CTk):
 
         coord_lbl = ctk.CTkLabel(
             pop, text=self._kakao_coord_summary(),
-            font=('Pretendard', 10), text_color='#9ca3af',
+            font=('Pretendard', 10), text_color=C.get('text_dim', '#667085'),
             justify='left'
         )
         coord_lbl.pack(pady=(6, 2))
@@ -5070,7 +5619,11 @@ class AraonWorkstation(ctk.CTk):
         )
         ctk.CTkSwitch(
             pop, text='업무 팝업 항상 위에',
-            font=('Pretendard', 12, 'bold'), variable=topmost_var
+            font=('Pretendard', 12, 'bold'), variable=topmost_var,
+            progress_color=self._palette['brand'],
+            button_color=self._palette['surface'],
+            button_hover_color=self._palette['surface_lo'],
+            text_color=self._palette['text'],
         ).pack(pady=(16, 5))
 
         def toggle_theme():
@@ -5078,9 +5631,8 @@ class AraonWorkstation(ctk.CTk):
             ctk.set_appearance_mode(new)
             self.cfg.set('SETTINGS', 'appearance_mode', new)
 
-        ctk.CTkButton(
-            pop, text='🌓 테마 전환',
-            fg_color='transparent', border_width=1, command=toggle_theme
+        self._make_button(
+            pop, text='🌓 테마 전환', variant='ghost', command=toggle_theme
         ).pack(pady=10)
 
         def save():
@@ -5099,26 +5651,28 @@ class AraonWorkstation(ctk.CTk):
             pop.destroy()
             self.write_system_log('환경설정 저장')
 
-        ctk.CTkButton(pop, text='저장하기', command=save,
-                      fg_color='#27ae60').pack(pady=15)
+        self._make_button(pop, text='저장하기', variant='primary', command=save).pack(pady=15)
 
     def popup_copy_edit(self):
         pop = ctk.CTkToplevel(self)
         pop.title('퀵카피 편집')
-        pop.geometry('600x700')
+        C = self._style_popup(pop, '640x720', minsize=(560, 620))
         pop.transient(self)
         pop.focus_force()
 
-        s = ctk.CTkScrollableFrame(pop)
+        s = ctk.CTkScrollableFrame(pop, fg_color=C.get('surface_hi', '#F6F8FB'))
         s.pack(fill='both', expand=True, padx=10, pady=10)
         ents = []
         for i in range(1, 16):
-            f = ctk.CTkFrame(s)
+            f = ctk.CTkFrame(
+                s, fg_color=C.get('surface', '#FFFFFF'),
+                corner_radius=12, border_width=1, border_color=C.get('border', '#D6DEE8')
+            )
             f.pack(fill='x', pady=2)
-            t_ent = ctk.CTkEntry(f, width=120)
+            t_ent = self._style_entry(ctk.CTkEntry(f, width=120))
             t_ent.insert(0, self.cfg.get('COPY_BUTTONS', f'btn_{i}_title', ''))
             t_ent.pack(side='left', padx=2)
-            x_ent = ctk.CTkEntry(f, width=350)
+            x_ent = self._style_entry(ctk.CTkEntry(f, width=350))
             x_ent.insert(0, self.cfg.get('COPY_BUTTONS', f'btn_{i}_text', ''))
             x_ent.pack(side='left', padx=2)
             ents.append((i, t_ent, x_ent))
@@ -5134,12 +5688,12 @@ class AraonWorkstation(ctk.CTk):
             pop.destroy()
             self.write_system_log('퀵카피 저장')
 
-        ctk.CTkButton(pop, text='저장', command=save).pack(pady=10)
+        self._make_button(pop, text='저장', variant='primary', command=save).pack(pady=10)
 
     def popup_accounts(self):
         pop = ctk.CTkToplevel(self)
         pop.title('LMS 계정 설정')
-        pop.geometry('350x250')
+        C = self._style_popup(pop, '380x280', minsize=(340, 240))
         pop.transient(self)
         pop.focus_force()
 
@@ -5148,16 +5702,16 @@ class AraonWorkstation(ctk.CTk):
                 pop,
                 text='⚠ keyring 미설치 — 계정이 평문으로 저장됩니다.\n'
                      'pip install keyring 을 실행하면 보안 저장됩니다.',
-                text_color='#e67e22', font=('Pretendard', 11)
+                text_color=C.get('warning', '#0145F2'), font=('Pretendard', 11)
             ).pack(pady=(10, 0), padx=20)
 
         ctk.CTkLabel(pop, text='[ LMS 계정 ]',
                      font=('Pretendard', 13, 'bold')).pack(pady=(20, 5))
         lms_id, lms_pw = self.cfg.get_credentials()
-        id_e = ctk.CTkEntry(pop, width=250, placeholder_text='ID')
+        id_e = self._style_entry(ctk.CTkEntry(pop, width=250, placeholder_text='ID'))
         id_e.insert(0, lms_id)
         id_e.pack(pady=4)
-        pw_e = ctk.CTkEntry(pop, width=250, placeholder_text='PW', show='*')
+        pw_e = self._style_entry(ctk.CTkEntry(pop, width=250, placeholder_text='PW', show='*'))
         pw_e.insert(0, lms_pw)
         pw_e.pack(pady=4)
 
@@ -5167,13 +5721,13 @@ class AraonWorkstation(ctk.CTk):
             pop.destroy()
             self.write_system_log('LMS 계정 갱신')
 
-        ctk.CTkButton(pop, text='저장', command=save).pack(pady=20)
+        self._make_button(pop, text='저장', variant='primary', command=save).pack(pady=20)
 
     def popup_class_room(self):
         """일괄 등록용 수업방 URL 설정 (개통방/입학식방 등 본인 방)."""
         pop = ctk.CTkToplevel(self)
         pop.title('수업방 URL 설정')
-        pop.geometry('560x360')
+        C = self._style_popup(pop, '580x400', minsize=(520, 340))
         pop.transient(self)
         pop.focus_force()
 
@@ -5191,14 +5745,14 @@ class AraonWorkstation(ctk.CTk):
                 '2) 본인 수업방 클릭\n'
                 '3) 주소창의 URL 전체를 복사 → 아래에 붙여넣기'
             ),
-            text_color='#888888', font=('Pretendard', 11),
+            text_color=C.get('text_dim', '#667085'), font=('Pretendard', 11),
             justify='left'
         ).pack(pady=(0, 12), padx=20)
 
-        url_e = ctk.CTkEntry(
+        url_e = self._style_entry(ctk.CTkEntry(
             pop, width=500,
             placeholder_text='https://www.lmsone.com/wcms/onAirClass/onAirClassWrite.asp?...'
-        )
+        ))
         # 구버전 호환: admission_room_url 값도 fallback 으로 읽음
         current = (self.cfg.get('LMS', 'class_room_url', '')
                    or self.cfg.get('LMS', 'admission_room_url', ''))
@@ -5218,8 +5772,7 @@ class AraonWorkstation(ctk.CTk):
             pop.destroy()
             self.write_system_log('수업방 URL 갱신')
 
-        ctk.CTkButton(pop, text='저장', command=save,
-                      fg_color='#27ae60').pack(pady=20)
+        self._make_button(pop, text='저장', variant='primary', command=save).pack(pady=20)
 
 
 # ─────────────────────────────────────────────
