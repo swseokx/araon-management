@@ -17,6 +17,8 @@ dist/
 build/
 release/
 ARAON_v*.zip
+*.exe
+*.spec
 
 # ── Python 가상환경 ───────────────────────────────────────────
 venv/
