@@ -46,7 +46,7 @@ class ConfigManager:
                 'k_column_width': '350',
                 'hotkey': 'F4',
                 'appearance_mode': 'dark',
-                'popup_topmost': 'True',
+                'popup_topmost': 'False',
                 'kakao_rate': '500',
                 'setup_rate': '3000',
             }
@@ -95,6 +95,9 @@ class ConfigManager:
             self.config.set('UPDATE', 'repo', _CORRECT_REPO)
         if not self.config.has_option('UPDATE', 'token'):
             self.config.set('UPDATE', 'token', '')
+        # v4.8.0: popup_topmost 기본값 True → False 마이그레이션
+        if self.config.get('SETTINGS', 'popup_topmost', fallback='False').strip() == 'True':
+            self.config.set('SETTINGS', 'popup_topmost', 'False')
         self.save()
 
     def save(self):

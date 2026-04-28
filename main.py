@@ -2039,6 +2039,12 @@ class AraonWorkstation(ctk.CTk):
         self.lms_info_cache[name] = info
         self._save_lms_cache()
 
+        # 팝업보다 브라우저가 위로 올라오지 않도록 최소화
+        try:
+            driver.minimize_window()
+        except Exception:
+            pass
+
         self.write_system_log(f'[{name}] 데이터 수집 완료. 팝업 생성...')
         self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, driver, info))
 
@@ -2050,11 +2056,12 @@ class AraonWorkstation(ctk.CTk):
         pop = ctk.CTkToplevel(self)
         pop.title(f'업무 처리 - {name}')
         C = self._style_popup(pop, '1080x820', minsize=(920, 700))
-        pop.transient(self)
+        # transient 제거 → 메인 창 클릭 시 팝업이 뒤로 내려갈 수 있도록
         pop.focus_force()
         pop.protocol('WM_DELETE_WINDOW', lambda: self.close_work_popup(pop, ui_row_idx))
 
-        is_topmost = self.cfg.getboolean('SETTINGS', 'popup_topmost', True)
+        # popup_topmost 기본값 False: 메인 창을 클릭하면 팝업이 뒤로 내려감
+        is_topmost = self.cfg.getboolean('SETTINGS', 'popup_topmost', False)
         pop.attributes('-topmost', is_topmost)
 
         info_f = ctk.CTkFrame(
@@ -2090,6 +2097,7 @@ class AraonWorkstation(ctk.CTk):
             text_color=C.get('text', '#18212F')
         ).pack(side='left')
 
+        # ── 오른쪽 컨트롤 (right → left 순서로 pack) ──────────────
         topmost_var = ctk.BooleanVar(value=is_topmost)
         ctk.CTkSwitch(
             row1, text='항상 위에',
@@ -2099,7 +2107,42 @@ class AraonWorkstation(ctk.CTk):
             button_color=self._palette['surface'],
             button_hover_color=self._palette['surface_lo'],
             text_color=self._palette['text'],
-        ).pack(side='right')
+        ).pack(side='right', padx=(8, 0))
+
+        # ── 번호 선택 버튼 (1~10) ──────────────────────────────────
+        seq_var = ctk.IntVar(value=0)   # 0 = 미선택
+
+        def _on_seq_btn(n: int):
+            if seq_var.get() == n:          # 같은 번호 재클릭 → 선택 해제
+                seq_var.set(0)
+                pop.title(f'업무 처리 - {name}')
+            else:
+                seq_var.set(n)
+                pop.title(f'업무 처리 - {name} ({n})')
+            # 버튼 색 갱신
+            for _n, _b in _seq_btns:
+                _b.configure(
+                    fg_color=C.get('brand', '#0145F2') if seq_var.get() == _n
+                    else C.get('surface_hi', '#F6F8FB'),
+                    text_color='#FFFFFF' if seq_var.get() == _n
+                    else C.get('text', '#18212F'),
+                )
+
+        seq_frame = ctk.CTkFrame(row1, fg_color='transparent')
+        seq_frame.pack(side='right', padx=(4, 4))
+        _seq_btns: list[tuple[int, ctk.CTkButton]] = []
+        for _n in range(1, 11):
+            _b = ctk.CTkButton(
+                seq_frame, text=str(_n), width=26, height=26,
+                font=('Pretendard', 11, 'bold'),
+                fg_color=C.get('surface_hi', '#F6F8FB'),
+                hover_color=C.get('surface_lo', '#E1E8F0'),
+                text_color=C.get('text', '#18212F'),
+                corner_radius=6,
+                command=lambda n=_n: _on_seq_btn(n),
+            )
+            _b.pack(side='left', padx=1)
+            _seq_btns.append((_n, _b))
 
         row2 = ctk.CTkFrame(info_f, fg_color='transparent')
         row2.pack(fill='x', padx=15, pady=(5, 15))
