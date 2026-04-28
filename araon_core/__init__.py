@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 araon_core 패키지.
 

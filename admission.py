@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 # --- admission.py  ARAON 입학식쌤 전용 v1.0 ---
 # 시트 열람 → 시간표 배정 → 체크 자동화
 

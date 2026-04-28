@@ -1,3 +1,5 @@
+:: Copyright (c) 2026 swseokx. All rights reserved.
+
 @echo off
 chcp 65001 >nul
 setlocal

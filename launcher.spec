@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 # -*- mode: python ; coding: utf-8 -*-
 # launcher.spec — ARAON실행.exe 빌드 설정
 # 빌드: pyinstaller launcher.spec --clean

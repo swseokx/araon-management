@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 ARAON 자동 업데이트 모듈 (GitHub Releases 기반)
 =================================================

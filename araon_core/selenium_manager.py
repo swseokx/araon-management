@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 araon_core/selenium_manager.py
 셀레늄 드라이버 팩토리 + 풀 관리

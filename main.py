@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 # --- main.py  ARAON Management ---
 # 전면 리팩토링: 보안·안정성·성능 개선판
 

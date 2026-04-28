@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 ARAON Launcher (GitHub Releases 자동업데이트)
 =============================================

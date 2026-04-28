@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 swseokx. All rights reserved. -->
+
 # ARAON Enterprise v4.0 — 설치 및 사용 가이드
 
 ## 📁 파일 구조

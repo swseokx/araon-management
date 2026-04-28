@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 araon_core/config_manager.py
 설정 관리 + 보안 자격증명 저장 (keyring 사용)

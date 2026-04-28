@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 araon_core/log_manager.py
 통합 로그 관리 — 시스템 로그 + 셋업 로그를 단일 클래스로 처리

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
 """
 araon_core/sheet_manager.py
 구글 시트 연동 — 인증 캐싱 + 배치 API 호출
