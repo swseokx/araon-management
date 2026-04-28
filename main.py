@@ -2002,6 +2002,151 @@ class AraonWorkstation(ctk.CTk):
             )
         return info
 
+    def _auto_enroll_class_room(self, driver, name: str) -> bool:
+        """
+        강의방 URL(설정)로 이동해 학생이 미등록 상태이면 자동 등록.
+        등록 후 학생 상세페이지(현재 URL)로 복귀.
+        반환: True=이미 등록됨 or 등록 성공, False=URL 없음 or 오류
+        """
+        room_url = self.cfg.get('LMS', 'class_room_url', '').strip()
+        if not room_url:
+            return False   # 강의방 URL 미설정 → 건너뜀
+
+        try:
+            driver.switch_to.default_content()
+            detail_url = driver.current_url   # 상세페이지 URL 보존
+
+            self.write_system_log(f'[{name}] 강의방 등록 여부 확인 중...')
+            driver.get(room_url)
+            wait       = WebDriverWait(driver, 10)
+            short_wait = WebDriverWait(driver, 3)
+
+            # 페이지 로드 대기
+            try:
+                wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
+                    )
+                )
+            except TimeoutException:
+                self.write_system_log(f'[{name}] 강의방 페이지 로드 실패 (URL 확인 필요)')
+                driver.get(detail_url)
+                return False
+
+            # ── 이미 등록되어 있는지 확인 ───────────────────────────
+            name_norm = _normalize_person_name(name)
+            enrolled = driver.execute_script(
+                """
+                var norm = arguments[0];
+                var trs = document.querySelectorAll('table tbody tr');
+                for (var tr of trs) {
+                    var tds = tr.querySelectorAll('td');
+                    for (var td of tds) {
+                        var t = td.textContent.replace(/\\s+/g,'').toLowerCase();
+                        if (t === norm || t.startsWith(norm + '(')) return true;
+                    }
+                }
+                return false;
+                """,
+                name_norm,
+            )
+
+            if enrolled:
+                self.write_system_log(f'[{name}] 이미 강의방에 등록되어 있음')
+                driver.get(detail_url)
+                return True
+
+            # ── 미등록 → 학생 검색 팝업으로 등록 ────────────────────
+            self.write_system_log(f'[{name}] 강의방 미등록 → 자동 등록 시작')
+            search_btn = wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
+                )
+            )
+            main_win = driver.current_window_handle
+            driver.execute_script('arguments[0].click();', search_btn)
+
+            wait.until(lambda d: len(d.window_handles) > 1)
+            for wh in driver.window_handles:
+                if wh != main_win:
+                    driver.switch_to.window(wh)
+                    break
+
+            kw = wait.until(EC.presence_of_element_located((By.NAME, 'keyWord')))
+            kw.clear()
+            kw.send_keys(name)
+            srch = driver.find_element(
+                By.XPATH,
+                "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
+            )
+            driver.execute_script('arguments[0].click();', srch)
+            time.sleep(1.2)
+
+            checkboxes = driver.find_elements(By.NAME, 'member_seq')
+            if not checkboxes:
+                self.write_system_log(f'[{name}] 강의방 등록: 검색 결과 없음')
+                driver.close()
+                driver.switch_to.window(main_win)
+                driver.get(detail_url)
+                return False
+
+            # 이름 정확 매칭 우선
+            name_lower = ' '.join(name.strip().split()).lower()
+            exact_cb = paren_cb = None
+            for cb in checkboxes:
+                try:
+                    for td in cb.find_elements(By.XPATH, './ancestor::tr/td'):
+                        td_t = ' '.join(td.text.strip().split()).lower()
+                        if td_t == name_lower:
+                            exact_cb = cb
+                            break
+                        elif td_t.startswith(name_lower + '(') and not paren_cb:
+                            paren_cb = cb
+                    if exact_cb:
+                        break
+                except Exception:
+                    pass
+
+            target_cb = exact_cb or paren_cb or checkboxes[0]
+            driver.execute_script('arguments[0].click();', target_cb)
+            time.sleep(0.3)
+
+            try:
+                submit_btn = driver.find_element(
+                    By.XPATH,
+                    "//input[@type='button' and @name='등록' and @value='등록']"
+                )
+                driver.execute_script('arguments[0].click();', submit_btn)
+            except Exception:
+                driver.execute_script('Submit();')
+
+            for _ in range(2):
+                try:
+                    short_wait.until(EC.alert_is_present()).accept()
+                    time.sleep(0.8)
+                except Exception:
+                    break
+
+            driver.close()
+            driver.switch_to.window(main_win)
+            self.write_system_log(f'[{name}] 강의방 자동 등록 완료!')
+
+        except Exception as e:
+            self.write_system_log(f'[{name}] 강의방 등록 오류: {e}')
+
+        finally:
+            # 항상 상세페이지로 복귀
+            try:
+                if driver.current_url != detail_url:
+                    driver.get(detail_url)
+                    WebDriverWait(driver, 8).until(
+                        EC.presence_of_element_located((By.TAG_NAME, 'body'))
+                    )
+            except Exception:
+                pass
+
+        return True
+
     def _fetch_and_show(self, ui_row_idx: int, name: str):
         cached = self.lms_info_cache.get(name)
         if cached:
@@ -2012,8 +2157,9 @@ class AraonWorkstation(ctk.CTk):
             def _bg_open():
                 driver = self._create_lms_driver(name)
                 if driver:
+                    self._auto_enroll_class_room(driver, name)
                     try:
-                        driver.minimize_window()   # 팝업 위로 안 올라오게
+                        driver.minimize_window()
                     except Exception:
                         pass
                     self.work_drivers[ui_row_idx] = driver
@@ -2038,6 +2184,9 @@ class AraonWorkstation(ctk.CTk):
         # 크롤링 결과를 캐시에 저장
         self.lms_info_cache[name] = info
         self._save_lms_cache()
+
+        # 강의방 미등록 시 자동 등록 (상세페이지 복귀 후 minimize)
+        self._auto_enroll_class_room(driver, name)
 
         # 팝업보다 브라우저가 위로 올라오지 않도록 최소화
         try:
