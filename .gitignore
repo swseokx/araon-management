@@ -10,6 +10,10 @@ log/
 setup_log/
 admission_log/
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+launcher.log
 *.pyc
 *.pyo
 *.pyd
@@ -18,9 +22,10 @@ __pycache__/
 dist/
 build/
 release/
+ARAON_v*/
 ARAON_v*.zip
 *.exe
-*.spec
+_ver.tmp
 
 # ── Python 가상환경 ───────────────────────────────────────────
 venv/
@@ -28,6 +33,7 @@ venv/
 env/
 
 # ── 기타 ─────────────────────────────────────────────────────
+.claude/settings.local.json
 *.log
 .DS_Store
 Thumbs.db

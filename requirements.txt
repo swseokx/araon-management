@@ -1,0 +1,17 @@
+# Copyright (c) 2026 swseokx. All rights reserved.
+
+customtkinter==5.2.2
+gspread==6.1.4
+oauth2client==4.1.3
+tkcalendar==1.6.1
+pyperclip==1.9.0
+keyboard==0.13.5
+pyautogui==0.9.54
+pygetwindow==0.0.9
+opencv-python==4.10.0.84
+numpy==2.1.3
+selenium==4.28.1
+webdriver-manager==4.0.2
+keyring==25.6.0
+pyinstaller==6.11.1
+requests==2.32.3

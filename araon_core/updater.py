@@ -36,6 +36,7 @@ except ImportError:
     _USE_REQUESTS = False
 
 _GITHUB_API = "https://api.github.com/repos/{repo}/releases/latest"
+_LAUNCHER_NAMES = ('ARAON.exe', 'launcher.exe', 'ARAON실행.exe')
 
 
 # ── 로컬 버전 ─────────────────────────────────────────────────────────────────
@@ -123,6 +124,23 @@ def _download_file(url: str, dest: str, token: str = '', progress_cb=None):
             progress_cb(1.0)
 
 
+def _safe_extract_zip(zf: zipfile.ZipFile, target_dir: Path) -> None:
+    """Zip Slip 경로 이탈을 막으면서 target_dir 아래로만 압축을 푼다."""
+    target_dir = target_dir.resolve()
+    for member in zf.infolist():
+        member_path = (target_dir / member.filename).resolve()
+        try:
+            member_path.relative_to(target_dir)
+        except ValueError:
+            raise RuntimeError(f'안전하지 않은 업데이트 파일 경로: {member.filename}')
+
+        try:
+            zf.extract(member, target_dir)
+        except PermissionError:
+            # 실행 중인 런처 EXE는 Windows에서 덮어쓸 수 없음. 나머지는 계속 갱신.
+            pass
+
+
 # ── 공개 API ──────────────────────────────────────────────────────────────────
 
 def check_update(repo: str, token: str = '') -> dict | None:
@@ -181,12 +199,7 @@ def apply_update(download_url: str, token: str = '', progress_cb=None):
     try:
         _download_file(download_url, tmp_path, token, progress_cb)
         with zipfile.ZipFile(tmp_path, 'r') as zf:
-            for member in zf.infolist():
-                try:
-                    zf.extract(member, app_dir)
-                except PermissionError:
-                    # 실행 중인 런처 EXE는 덮어쓸 수 없음 — 무시하고 계속
-                    pass
+            _safe_extract_zip(zf, app_dir)
     finally:
         try:
             os.unlink(tmp_path)
@@ -195,12 +208,12 @@ def apply_update(download_url: str, token: str = '', progress_cb=None):
 
 
 def restart_app():
-    """런처 재시작. launcher.exe → ARAON실행.exe 순으로 탐색."""
+    """런처 재시작. 현재 배포명 우선, 구버전 이름은 호환용으로 탐색."""
     base = Path(
         sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
     ).parent
 
-    for name in ('launcher.exe', 'ARAON실행.exe'):
+    for name in _LAUNCHER_NAMES:
         launcher = base / name
         if launcher.exists():
             subprocess.Popen([str(launcher)])

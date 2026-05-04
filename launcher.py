@@ -3,7 +3,7 @@
 """
 ARAON Launcher (GitHub Releases 자동업데이트)
 =============================================
-사용자는 main.exe 대신 이 파일(ARAON실행.exe)을 실행하세요.
+사용자는 main.exe 대신 이 파일(ARAON.exe)을 실행하세요.
 
 동작 순서:
   1. settings.ini 에서 GitHub repo / token 읽기

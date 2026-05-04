@@ -77,6 +77,37 @@ def _normalize_person_name(name: str) -> str:
     return re.sub(r'\s+', '', (name or '').strip()).lower()
 
 
+def _get_all_chrome_hwnds() -> set:
+    """현재 존재하는 Chrome_WidgetWin_1 클래스 창의 HWND 집합을 반환한다."""
+    try:
+        import win32gui
+        hwnds: set = set()
+        def _cb(hwnd, _):
+            try:
+                if win32gui.GetClassName(hwnd) == 'Chrome_WidgetWin_1':
+                    hwnds.add(hwnd)
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(_cb, None)
+        return hwnds
+    except Exception:
+        return set()
+
+
+def _send_hwnd_to_bottom(hwnd: int) -> None:
+    """HWND 를 Z-Order 맨 아래로 내린다 (HWND_BOTTOM, 이동/리사이즈 없음)."""
+    try:
+        import win32gui, win32con
+        win32gui.SetWindowPos(
+            hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE,
+        )
+    except Exception:
+        pass
+
+
+
 # ─────────────────────────────────────────────
 #  메인 앱
 # ─────────────────────────────────────────────
@@ -109,6 +140,7 @@ class AraonWorkstation(ctk.CTk):
         self.row_widgets: dict[int, list] = {}
         self.admission_row_widgets: dict[int, list] = {}
         self.work_drivers: dict = {}
+        self.work_driver_hwnds: dict = {}   # ui_row_idx → Chrome HWND
         self._ezview_debug_driver = None
         self.qc_pop = None
         self._monitor_visible: bool = True
@@ -817,6 +849,14 @@ class AraonWorkstation(ctk.CTk):
         else:
             self._run_kakao_macro_coords()
 
+    @staticmethod
+    def _is_kakao_window(win) -> bool:
+        """활성창 제목으로 카카오톡 채널/카카오 비즈 창인지 판별."""
+        title = (getattr(win, 'title', '') or '').lower()
+        if not title:
+            return False
+        return any(k in title for k in ('kakao', '카카오'))
+
     def _run_kakao_macro_coords(self):
         """좌표 기반 카톡 매크로.
         1~3번 버튼(전송/상담중/상담완료)은 활성 카톡창 좌상단 기준 고정 오프셋,
@@ -839,6 +879,15 @@ class AraonWorkstation(ctk.CTk):
                 return
             if win.width <= 0 or win.height <= 0:
                 self.write_system_log('에러: 활성창 크기 비정상')
+                return
+            if not self._is_kakao_window(win):
+                self.write_system_log(
+                    f'⚠ 카카오톡 창이 아니라서 매크로를 중단합니다. (활성창: "{win.title}")'
+                )
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONHAND)
+                except Exception:
+                    pass
                 return
 
             self.write_system_log(
@@ -908,6 +957,15 @@ class AraonWorkstation(ctk.CTk):
                 self.write_system_log(
                     '안내: 활성창이 없습니다. 카카오톡 상담창을 먼저 클릭해주세요.'
                 )
+                return
+            if not self._is_kakao_window(win):
+                self.write_system_log(
+                    f'⚠ 카카오톡 창이 아니라서 매크로를 중단합니다. (활성창: "{win.title}")'
+                )
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONHAND)
+                except Exception:
+                    pass
                 return
             self.write_system_log(
                 f'카카오 매크로 가동 (대상: "{win.title}" / 크기 {win.width}x{win.height})'
@@ -1849,7 +1907,7 @@ class AraonWorkstation(ctk.CTk):
                     (By.CSS_SELECTOR, "input[name='keyword'], input[name='keyWord']")
                 )
             )
-            driver.execute_script(f"arguments[0].value = '{name}';", search_box)
+            driver.execute_script("arguments[0].value = arguments[1];", search_box, name)
             search_box.send_keys(Keys.ENTER)
             time.sleep(0.5)
 
@@ -1884,10 +1942,75 @@ class AraonWorkstation(ctk.CTk):
             SeleniumManager.safe_quit(locals().get('driver'))
             return None
 
+    def _create_lms_driver_direct(self, name: str, detail_url: str):
+        """캐시된 상세페이지 URL로 바로 진입하는 변형. 검색 단계 생략."""
+        if not detail_url:
+            return None
+        lms_id, lms_pw = self.cfg.get_credentials()
+        try:
+            driver = SeleniumManager.create_incognito()
+            SeleniumManager.lms_login(driver, lms_id, lms_pw)
+            driver.get(detail_url)
+
+            # iframe / frame 안의 user_id 입력이 잡힐 때까지 폴링.
+            # eager 로드 전략 + 로그인 직후 페이지라 iframe 채워지는 데
+            # 시간이 걸릴 수 있어 한 번 호출은 false negative 가 잦음.
+            try:
+                WebDriverWait(driver, 8).until(
+                    lambda d: self._switch_to_detail_frame(d)
+                )
+            except TimeoutException:
+                # 진짜로 만료/잘못된 URL 인 경우만 검색 폴백.
+                # 현재 URL 이 memWrite.asp 가 아니면 (예: 로그인으로 리다이렉트)
+                # 폴백, 아니면 한 번 더 새로고침 시도.
+                cur = ''
+                try:
+                    cur = driver.current_url or ''
+                except Exception:
+                    pass
+                if 'memWrite.asp' in cur:
+                    try:
+                        driver.refresh()
+                        WebDriverWait(driver, 6).until(
+                            lambda d: self._switch_to_detail_frame(d)
+                        )
+                    except Exception:
+                        self.write_system_log(
+                            f"[{name}] 직행 URL 로드 후 프레임 탐색 실패 — 검색 흐름으로 폴백"
+                        )
+                        SeleniumManager.safe_quit(driver)
+                        return None
+                else:
+                    self.write_system_log(
+                        f"[{name}] 직행 URL 가 detail 이 아님(현재: {cur[:80]}) — 검색 흐름으로 폴백"
+                    )
+                    SeleniumManager.safe_quit(driver)
+                    return None
+
+            driver.switch_to.default_content()
+            return driver
+        except Exception as e:
+            self.write_system_log(f'LMS 직행 드라이버 로딩 실패: {e}')
+            SeleniumManager.safe_quit(locals().get('driver'))
+            return None
+
     # ──────────────────────────────────────────
     #  업무 팝업 (열기)
     # ──────────────────────────────────────────
+    def _minimize_existing_lms_windows(self):
+        """기존에 떠있는 LMS Chrome 창들을 모두 최소화해 새 팝업 가림 방지."""
+        try:
+            for drv in list(self.work_drivers.values()):
+                try:
+                    drv.minimize_window()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def open_work_popup(self, ui_row_idx: int, name: str):
+        # 새 업무 팝업이 기존 상세페이지(LMS Chrome 창)에 가려지지 않도록 먼저 최소화
+        self._minimize_existing_lms_windows()
         self.write_system_log(f'[{name}] 상세페이지 로딩 중...')
         self.show_toast_notification('LMS 로딩 중', f'[{name}] 정보를 불러옵니다...')
         threading.Thread(
@@ -1899,8 +2022,22 @@ class AraonWorkstation(ctk.CTk):
         """driver가 위치한 LMS 학생 상세페이지에서 정보 추출."""
         info = {
             'id': '-', 'nm': '-', 'sch': '-', 'grd': '-',
-            'p_nm': '-', 'hp': '-', 'p_hp': '-', 'history': ''
+            'p_nm': '-', 'hp': '-', 'p_hp': '-', 'history': '',
+            'detail_url': '',
         }
+        # 다음 번 '열기' 시 회원검색 단계를 건너뛰고 바로 진입할 수 있게
+        # 현재 상세페이지 URL을 캐시 가능한 정규 형태로 보존.
+        try:
+            cur = driver.current_url or ''
+            mid = re.search(r'member_id=([^&]+)', cur)
+            mseq = re.search(r'member_seq=([^&]+)', cur)
+            if mid and mseq:
+                info['detail_url'] = (
+                    'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
+                    f'?mode=U&member_id={mid.group(1)}&member_seq={mseq.group(1)}'
+                )
+        except Exception:
+            pass
         try:
             self.write_system_log(f'[{name}] 스마트 프레임 탐색 시작')
             found = False
@@ -2034,22 +2171,57 @@ class AraonWorkstation(ctk.CTk):
                 return False
 
             # ── 이미 등록되어 있는지 확인 ───────────────────────────
+            # 강의방 학생 테이블이 비동기 로딩이라 빈 테이블에 false 가 떨어지지
+            # 않도록, "데이터 행 등장 OR 명시적 빈 상태"가 보일 때까지 잠깐 대기.
+            try:
+                WebDriverWait(driver, 4).until(
+                    lambda d: d.execute_script(
+                        """
+                        var rows = document.querySelectorAll('table tbody tr');
+                        if (rows.length === 0) return false;
+                        for (var r of rows) {
+                            var t = (r.textContent || '').trim();
+                            if (t.length > 0) return true;
+                        }
+                        return false;
+                        """
+                    )
+                )
+            except TimeoutException:
+                pass  # 진짜 빈 강의방일 수도 있으니 그대로 진행
+
             name_norm = _normalize_person_name(name)
-            enrolled = driver.execute_script(
-                """
-                var norm = arguments[0];
-                var trs = document.querySelectorAll('table tbody tr');
-                for (var tr of trs) {
-                    var tds = tr.querySelectorAll('td');
-                    for (var td of tds) {
-                        var t = td.textContent.replace(/\\s+/g,'').toLowerCase();
-                        if (t === norm || t.startsWith(norm + '(')) return true;
+            cached = self.lms_info_cache.get(name) or {}
+            id_norm = (cached.get('id') or '').strip().lower()
+
+            def _check_enrolled() -> bool:
+                return bool(driver.execute_script(
+                    """
+                    var nameNorm = arguments[0];
+                    var idNorm = arguments[1] || '';
+                    var trs = document.querySelectorAll('table tbody tr');
+                    for (var tr of trs) {
+                        var rowFlat = (tr.textContent || '')
+                            .replace(/\\s+/g, '').toLowerCase();
+                        if (idNorm && rowFlat.indexOf(idNorm) >= 0) return true;
+                        var tds = tr.querySelectorAll('td');
+                        for (var td of tds) {
+                            var t = (td.textContent || '')
+                                .replace(/\\s+/g, '').toLowerCase();
+                            if (t === nameNorm) return true;
+                            if (t.startsWith(nameNorm + '(')) return true;
+                        }
                     }
-                }
-                return false;
-                """,
-                name_norm,
-            )
+                    return false;
+                    """,
+                    name_norm, id_norm,
+                ))
+
+            enrolled = _check_enrolled()
+            if not enrolled:
+                # 비동기 갱신을 한 번 더 기다린 뒤 재검사
+                time.sleep(0.8)
+                enrolled = _check_enrolled()
 
             if enrolled:
                 self.write_system_log(f'[{name}] 이미 강의방에 등록되어 있음')
@@ -2154,16 +2326,45 @@ class AraonWorkstation(ctk.CTk):
             self.write_system_log(f'[{name}] 캐시 사용. 팝업 먼저 표시 후 브라우저 준비 시작')
             self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, None, cached))
 
+            detail_url = (cached.get('detail_url') or '').strip()
+
             def _bg_open():
-                driver = self._create_lms_driver(name)
+                before_hwnds = _get_all_chrome_hwnds()
+                driver = None
+                if detail_url:
+                    driver = self._create_lms_driver_direct(name, detail_url)
+                if driver is None:
+                    # 레거시 캐시(detail_url 없음) 또는 직행 실패 → 기존 검색 흐름
+                    driver = self._create_lms_driver(name)
+                    # 검색 흐름으로 들어왔다면 detail_url 을 채워둔다
+                    if driver is not None:
+                        try:
+                            cur = driver.current_url or ''
+                            mid = re.search(r'member_id=([^&]+)', cur)
+                            mseq = re.search(r'member_seq=([^&]+)', cur)
+                            if mid and mseq:
+                                cached['detail_url'] = (
+                                    'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
+                                    f'?mode=U&member_id={mid.group(1)}&member_seq={mseq.group(1)}'
+                                )
+                                self.lms_info_cache[name] = cached
+                                self._save_lms_cache()
+                        except Exception:
+                            pass
+
                 if driver:
                     self._auto_enroll_class_room(driver, name)
-                    try:
-                        driver.minimize_window()
-                    except Exception:
-                        pass
+                    # 새로 생긴 Chrome HWND 를 찾아 저장 (Z-order 관리용)
+                    new_hwnds = _get_all_chrome_hwnds() - before_hwnds
+                    if new_hwnds:
+                        hwnd = next(iter(new_hwnds))
+                        self.work_driver_hwnds[ui_row_idx] = hwnd
+                        _send_hwnd_to_bottom(hwnd)
                     self.work_drivers[ui_row_idx] = driver
-                    self.write_system_log(f'[{name}] 브라우저 준비 완료 (최소화 상태)')
+                    self.write_system_log(
+                        f'[{name}] 브라우저 준비 완료 '
+                        f'({"직행" if detail_url else "검색"} · 뒤로 이동)'
+                    )
                 else:
                     self.write_system_log(f'[{name}] 브라우저 준비 실패')
 
@@ -2171,6 +2372,7 @@ class AraonWorkstation(ctk.CTk):
             return
 
         # ── 캐시 미스: 기존 방식으로 전체 크롤링 ──
+        before_hwnds = _get_all_chrome_hwnds()
         driver = self._create_lms_driver(name)
         if not driver:
             self.after(
@@ -2185,14 +2387,15 @@ class AraonWorkstation(ctk.CTk):
         self.lms_info_cache[name] = info
         self._save_lms_cache()
 
-        # 강의방 미등록 시 자동 등록 (상세페이지 복귀 후 minimize)
+        # 강의방 미등록 시 자동 등록
         self._auto_enroll_class_room(driver, name)
 
-        # 팝업보다 브라우저가 위로 올라오지 않도록 최소화
-        try:
-            driver.minimize_window()
-        except Exception:
-            pass
+        # 새로 생긴 Chrome HWND 를 찾아 저장 (Z-order 관리용)
+        new_hwnds = _get_all_chrome_hwnds() - before_hwnds
+        if new_hwnds:
+            hwnd = next(iter(new_hwnds))
+            self.work_driver_hwnds[ui_row_idx] = hwnd
+            _send_hwnd_to_bottom(hwnd)
 
         self.write_system_log(f'[{name}] 데이터 수집 완료. 팝업 생성...')
         self.after(0, lambda: self._build_work_popup_ui(ui_row_idx, name, driver, info))
@@ -2208,10 +2411,7 @@ class AraonWorkstation(ctk.CTk):
         # transient 제거 → 메인 창 클릭 시 팝업이 뒤로 내려갈 수 있도록
         pop.focus_force()
         pop.protocol('WM_DELETE_WINDOW', lambda: self.close_work_popup(pop, ui_row_idx))
-
-        # popup_topmost 기본값 False: 메인 창을 클릭하면 팝업이 뒤로 내려감
-        is_topmost = self.cfg.getboolean('SETTINGS', 'popup_topmost', False)
-        pop.attributes('-topmost', is_topmost)
+        pop.lift()
 
         info_f = ctk.CTkFrame(
             pop,
@@ -2247,16 +2447,29 @@ class AraonWorkstation(ctk.CTk):
         ).pack(side='left')
 
         # ── 오른쪽 컨트롤 (right → left 순서로 pack) ──────────────
-        topmost_var = ctk.BooleanVar(value=is_topmost)
-        ctk.CTkSwitch(
-            row1, text='항상 위에',
-            variable=topmost_var,
-            command=lambda: pop.attributes('-topmost', topmost_var.get()),
-            progress_color=self._palette['brand'],
-            button_color=self._palette['surface'],
-            button_hover_color=self._palette['surface_lo'],
-            text_color=self._palette['text'],
-        ).pack(side='right', padx=(8, 0))
+
+        # 캐시 새로고침 — 깨진 캐시(이력 누락 / 학부모폰 '-' 등) 즉시 교정
+        self._make_button(
+            row1, text='🔄 새로고침', variant='ghost',
+            width=92, height=28,
+            command=lambda: self._refresh_work_popup(ui_row_idx, name, pop),
+        ).pack(side='right', padx=(4, 4))
+
+        # ── Chrome 창 항상 아래 유지 루프 ──────────────────────────
+        # 팝업이 열려있는 동안 해당 row 의 Chrome HWND 를 HWND_BOTTOM 으로 계속 전송
+        # → 팝업이 별도로 topmost 일 필요 없이 자연스럽게 위에 놓인다.
+        def _keep_chrome_bottom():
+            try:
+                if not pop.winfo_exists():
+                    return
+            except Exception:
+                return
+            hwnd = self.work_driver_hwnds.get(ui_row_idx)
+            if hwnd:
+                _send_hwnd_to_bottom(hwnd)
+            pop.after(800, _keep_chrome_bottom)
+
+        pop.after(800, _keep_chrome_bottom)
 
         # ── 번호 선택 버튼 (1~10) ──────────────────────────────────
         seq_var = ctk.IntVar(value=0)   # 0 = 미선택
@@ -2547,7 +2760,60 @@ class AraonWorkstation(ctk.CTk):
         as_list.bind('<Double-Button-1>', add_text)
         on_radio_change()
 
+    def _refresh_work_popup(self, ui_row_idx: int, name: str, pop):
+        """현재 업무 팝업의 캐시 정보를 라이브 driver 로 다시 크롤해 즉시 갱신.
+        깨진 캐시(이력/학부모폰 누락 등) 일회 교정용.
+        driver 는 그대로 유지하므로 재로그인 없이 빠르게 새로고침."""
+        drv = self.work_drivers.get(ui_row_idx)
+        if drv is None:
+            self.show_toast_notification(
+                '알림', '브라우저가 아직 준비 중입니다. 잠시 후 다시 시도해주세요.'
+            )
+            return
+
+        self.write_system_log(f'[{name}] 캐시 새로고침 시작...')
+
+        def _bg():
+            try:
+                cached = self.lms_info_cache.get(name) or {}
+                preserve_url = (cached.get('detail_url') or '').strip()
+
+                # driver 가 다른 페이지(강의방 등) 에 있을 수 있으니 상세로 복귀
+                try:
+                    cur = drv.current_url or ''
+                    if 'memWrite.asp' not in cur and preserve_url:
+                        drv.get(preserve_url)
+                        time.sleep(0.8)
+                except Exception:
+                    pass
+
+                new_info = self._extract_lms_info(drv, name)
+                if not new_info.get('detail_url') and preserve_url:
+                    new_info['detail_url'] = preserve_url
+                self.lms_info_cache[name] = new_info
+                self._save_lms_cache()
+                self.write_system_log(f'[{name}] 캐시 새로고침 완료')
+
+                def _swap():
+                    try:
+                        pop.destroy()
+                    except Exception:
+                        pass
+                    # driver 는 work_drivers 에 그대로 두고 팝업만 재생성
+                    self._build_work_popup_ui(ui_row_idx, name, None, new_info)
+
+                self.after(0, _swap)
+            except Exception as e:
+                err = str(e)
+                self.write_system_log(f'[{name}] 새로고침 실패: {err}')
+                self.after(
+                    0, lambda: messagebox.showerror('새로고침 실패', err)
+                )
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def close_work_popup(self, pop, ui_row_idx):
+        self.work_driver_hwnds.pop(ui_row_idx, None)   # HWND_BOTTOM 루프 중단
         driver = self.work_drivers.pop(ui_row_idx, None)
         try:
             pop.destroy()
@@ -5083,6 +5349,90 @@ class AraonWorkstation(ctk.CTk):
                 continue
         return False
 
+    def _ask_attend_range(self, total: int, default: str = 'all') -> str | None:
+        """출석체크 저장 기간 선택 다이얼로그.
+        반환값: 'today' | 'week' | 'month' | 'all' | None(취소)."""
+        pop = ctk.CTkToplevel(self)
+        pop.title('출석체크 기간 선택')
+        C = self._style_popup(pop, '420x360', minsize=(380, 320))
+        pop.transient(self)
+        pop.attributes('-topmost', True)
+        pop.lift()
+        pop.focus_force()
+        pop.grab_set()
+
+        result: dict[str, str | None] = {'mode': None}
+        var = ctk.StringVar(value=default)
+
+        shell = ctk.CTkFrame(
+            pop, fg_color=C.get('surface', '#FFFFFF'),
+            corner_radius=14, border_width=1,
+            border_color=C.get('border', '#D6DEE8'),
+        )
+        shell.pack(fill='both', expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            shell,
+            text=f'📋 첫수업명단 {total}명의 출석체크 저장',
+            font=('Pretendard', 14, 'bold'),
+            text_color=C.get('text', '#18212F'),
+        ).pack(anchor='w', pady=(2, 4))
+        ctk.CTkLabel(
+            shell,
+            text=('저장 대상(첫수업일 기준)을 선택하세요.\n'
+                  '저장되는 출석 기간은 항상 "첫수업일 ~ 회원구분별 종료일"입니다.'),
+            font=('Pretendard', 11),
+            text_color=C.get('text_dim', '#667085'),
+            justify='left',
+        ).pack(anchor='w', pady=(0, 10))
+
+        opts = [
+            ('today', '오늘',     '첫수업일 == 오늘 인 학생만'),
+            ('week',  '일주일',   '첫수업일이 오늘 ~ 7일 전 인 학생'),
+            ('month', '한 달',    '첫수업일이 오늘 ~ 1개월 전 인 학생'),
+            ('all',   '전체',     '첫수업명단의 모든 학생 (전체 재처리)'),
+        ]
+        for key, lbl, hint in opts:
+            row = ctk.CTkFrame(shell, fg_color='transparent')
+            row.pack(fill='x', pady=2)
+            ctk.CTkRadioButton(
+                row, text=lbl, variable=var, value=key,
+                font=('Pretendard', 13, 'bold'),
+                text_color=C.get('text', '#18212F'),
+                fg_color=C.get('brand', '#0145F2'),
+                hover_color=C.get('brand_hv', '#0136BD'),
+                border_color=C.get('border', '#D6DEE8'),
+            ).pack(side='left')
+            ctk.CTkLabel(
+                row, text=f'  — {hint}',
+                font=('Pretendard', 11),
+                text_color=C.get('text_dim', '#667085'),
+            ).pack(side='left')
+
+        btn_row = ctk.CTkFrame(shell, fg_color='transparent')
+        btn_row.pack(fill='x', pady=(12, 2))
+
+        def _confirm():
+            result['mode'] = var.get()
+            pop.destroy()
+
+        def _cancel():
+            result['mode'] = None
+            pop.destroy()
+
+        self._make_button(
+            btn_row, text='저장 시작', variant='primary',
+            command=_confirm, height=36,
+        ).pack(side='right', padx=(8, 0))
+        self._make_button(
+            btn_row, text='취소', variant='ghost',
+            command=_cancel, height=36,
+        ).pack(side='right')
+
+        pop.protocol('WM_DELETE_WINDOW', _cancel)
+        pop.wait_window()
+        return result['mode']
+
     def start_attend_check(self):
         if self._attend_check_running:
             messagebox.showwarning('경고', '이미 출석체크 저장이 진행 중입니다.')
@@ -5097,58 +5447,94 @@ class AraonWorkstation(ctk.CTk):
             messagebox.showinfo('알림', '첫수업명단 시트에 학생이 없습니다.')
             return
 
-        # 오늘 기준 2주 전 이후의 첫수업일 학생만 대상 (오래된 데이터 스킵)
+        range_mode = self._ask_attend_range(total=len(students), default='all')
+        if range_mode is None:
+            return
+
+        # 모드별 첫수업일 필터.
+        #   today : first_class == today
+        #   week  : today - 7일  ≤ first_class ≤ today
+        #   month : today - 1개월 ≤ first_class ≤ today
+        #   all   : 필터 없음
+        # 출석 저장 시 입력될 sdate/edate 는 모드 무관하게 항상
+        # "첫수업일 ~ 첫수업일 + 회원구분별 +N개월" 로 박힘.
         import datetime
         today = datetime.date.today()
-        cutoff = today - datetime.timedelta(days=14)
+        if range_mode == 'today':
+            cutoff_lo = today
+        elif range_mode == 'week':
+            cutoff_lo = today - datetime.timedelta(days=7)
+        elif range_mode == 'month':
+            # _add_months 는 문자열 기반이라 그대로 활용
+            mo_str = self._add_months(today.isoformat(), -1)
+            y, mo, d = map(int, mo_str.split('-'))
+            cutoff_lo = datetime.date(y, mo, d)
+        else:
+            cutoff_lo = None  # 전체
 
-        def _within_window(s: dict) -> bool:
+        def _in_window(s: dict) -> bool:
             parsed = self._parse_first_class_date(s.get('first_class', ''))
             if not parsed:
-                return True  # 날짜 누락은 기존처럼 처리(뒤에서 스킵)
+                # 날짜 누락 학생: 'all' 일 때만 통과(매크로가 스킵 처리),
+                # 그 외 모드는 날짜로 대상 판별이 불가능하므로 제외.
+                return cutoff_lo is None
             try:
                 y, mo, d = map(int, parsed.split('-'))
-                return datetime.date(y, mo, d) >= cutoff
+                fc = datetime.date(y, mo, d)
             except Exception:
+                return cutoff_lo is None
+            if cutoff_lo is None:
                 return True
+            return cutoff_lo <= fc <= today
 
         before_filter = len(students)
-        students = [s for s in students if _within_window(s)]
+        students = [s for s in students if _in_window(s)]
         filtered_out = before_filter - len(students)
         if not students:
+            label = {
+                'today': f'오늘({today.isoformat()})',
+                'week':  f'오늘 ~ 7일 전({cutoff_lo.isoformat() if cutoff_lo else "-"})',
+                'month': f'오늘 ~ 1개월 전({cutoff_lo.isoformat() if cutoff_lo else "-"})',
+                'all':   '전체',
+            }.get(range_mode, range_mode)
             messagebox.showinfo(
                 '알림',
-                f'2주 전({cutoff.isoformat()}) 이후 첫수업일 대상자가 없습니다.\n'
+                f'[{label}] 조건에 해당하는 학생이 없습니다.\n'
                 f'(전체 {before_filter}명 중 모두 제외)'
             )
             return
 
-        total = len(students)
-        no_date = sum(1 for s in students if not self._parse_first_class_date(s['first_class']))
-        msg = (
-            f'첫수업명단 {total}명의 출석체크를 저장하시겠습니까?\n\n'
-            f'• 출석체크: Y\n'
-            f'• 시작일: R열 첫수업일 (오늘 기준 2주 전 이후만 대상)\n'
-            f'• 종료일: GT-BASIC/GT-LINK/무료체험 +2개월,\n'
-            f'         GT-PRO +6개월\n\n'
-            + (f'📅 기준일 {cutoff.isoformat()} 이전 첫수업일 {filtered_out}명 제외\n'
-               if filtered_out else '')
-            + (f'⚠ 날짜 누락 {no_date}명은 자동 스킵됩니다.\n' if no_date else '')
-            + '(대상 외 회원구분은 스킵)'
+        # 전체(all) 재처리는 시트 전체에 덮어쓰기되므로 실수 방지 확인
+        if range_mode == 'all':
+            if not messagebox.askyesno(
+                '전체 재처리 확인',
+                f'전체 모드는 첫수업명단 {len(students)}명 전원을 재처리합니다.\n'
+                f'(첫수업일이 오래된 학생까지 모두 포함, 시트 데이터 덮어쓰기)\n\n'
+                f'정말 진행할까요?'
+            ):
+                return
+
+        self.write_system_log(
+            f'출석체크 저장 — 모드 [{range_mode}], 대상 {len(students)}명'
+            + (f' (필터 제외 {filtered_out}명)' if filtered_out else '')
         )
-        if not messagebox.askyesno('확인', msg):
-            return
 
         self._attend_check_running = True
         threading.Thread(
             target=self._run_attend_check,
-            args=(students,), daemon=True
+            args=(students, range_mode), daemon=True
         ).start()
 
-    def _run_attend_check(self, students: list[dict]):
+    def _run_attend_check(self, students: list[dict], range_mode: str = 'all'):
         """
         첫수업명단 학생들의 출석체크 저장 매크로.
         회원관리 메뉴 권한이 없는 계정도 URL 직결로 접근.
+
+        range_mode 는 학생 필터링(사전 처리)에만 영향을 주며, 저장되는
+        sdate/edate 는 모드와 무관하게 항상 다음과 같이 박힘:
+            sdate = 그 학생의 첫수업일
+            edate = sdate + 회원구분별 +N개월
+                    (1403/1419/1401 = +2개월, 1420 = +6개월)
         """
         lms_id, lms_pw = self.cfg.get_credentials()
         driver = None
@@ -5157,9 +5543,18 @@ class AraonWorkstation(ctk.CTk):
         skipped_nofound = 0
         skipped_nogb = 0
         errors = 0
+
+        range_label = {
+            'today': '오늘',
+            'week':  '일주일',
+            'month': '한 달',
+            'all':   '전체',
+        }.get(range_mode, range_mode)
         try:
             total = len(students)
-            self.write_system_log(f'출석체크 저장 시작 — 총 {total}명')
+            self.write_system_log(
+                f'출석체크 저장 시작 — 총 {total}명 [모드: {range_label}]'
+            )
             driver = SeleniumManager.create_incognito(background=True)
             SeleniumManager.lms_login(driver, lms_id, lms_pw)
             wait = WebDriverWait(driver, 10)
@@ -5175,9 +5570,10 @@ class AraonWorkstation(ctk.CTk):
             for idx, student in enumerate(students, 1):
                 name = student['name']
                 sdate_raw = student.get('first_class', '')
-                sdate = self._parse_first_class_date(sdate_raw)
                 tag = f'[{idx}/{total}]'
 
+                # 모드 무관: 시작일은 항상 첫수업일
+                sdate = self._parse_first_class_date(sdate_raw)
                 if not sdate:
                     self.write_system_log(
                         f'{tag} {name} — 첫수업일 없음/파싱 실패("{sdate_raw}") 스킵'
@@ -5197,7 +5593,7 @@ class AraonWorkstation(ctk.CTk):
                         )
                     )
                     driver.execute_script(
-                        f"arguments[0].value = '{name}';", search_box
+                        "arguments[0].value = arguments[1];", search_box, name
                     )
                     search_box.send_keys(Keys.ENTER)
                     time.sleep(0.5)
@@ -5328,9 +5724,9 @@ class AraonWorkstation(ctk.CTk):
                         pass
 
             summary = (
-                f'출석체크 저장 완료\n\n'
+                f'출석체크 저장 완료 [모드: {range_label}]\n\n'
                 f'✓ 성공: {success}명\n'
-                f'⏭ 날짜 없음: {skipped_nodate}명\n'
+                f'⏭ 첫수업일 없음/파싱실패: {skipped_nodate}명\n'
                 f'⏭ 검색 결과 없음: {skipped_nofound}명\n'
                 f'⏭ 회원구분 대상 외: {skipped_nogb}명\n'
                 f'✗ 오류: {errors}명'
@@ -5554,6 +5950,136 @@ class AraonWorkstation(ctk.CTk):
             SeleniumManager.safe_quit(driver)
             self._bulk_enroll_running = False
 
+    # ──────────────────────────────────────────
+    #  캐시 detail_url 일괄 백필
+    # ──────────────────────────────────────────
+    def start_detail_url_backfill(self):
+        """레거시 캐시 엔트리들에 detail_url 을 일괄 채워, '열기' 시 검색 단계 생략."""
+        if getattr(self, '_backfill_running', False):
+            messagebox.showinfo('알림', '이미 백필이 진행 중입니다.')
+            return
+
+        targets = [
+            nm for nm, info in self.lms_info_cache.items()
+            if isinstance(info, dict) and not (info.get('detail_url') or '').strip()
+        ]
+        if not targets:
+            messagebox.showinfo(
+                '알림',
+                '모든 캐시 엔트리에 직행 URL이 이미 채워져 있습니다.'
+            )
+            return
+
+        msg = (
+            f'{len(targets)}명의 학생에 대해 직행 URL을 백필합니다.\n'
+            f'(전체 캐시 {len(self.lms_info_cache)}명 중)\n\n'
+            f'• 백그라운드에서 LMS 검색이 순차 진행됩니다.\n'
+            f'• 학생당 약 1.5초 소요 예상.\n'
+            f'• 완료 후 모든 학생 "열기"가 검색 없이 직행됩니다.\n\n'
+            f'계속할까요?'
+        )
+        if not messagebox.askyesno('직행 URL 백필', msg):
+            return
+
+        self._backfill_running = True
+        threading.Thread(
+            target=self._run_detail_url_backfill,
+            args=(targets,), daemon=True
+        ).start()
+
+    def _run_detail_url_backfill(self, names: list):
+        lms_id, lms_pw = self.cfg.get_credentials()
+        driver = None
+        success = 0
+        not_found = 0
+        errors = 0
+        try:
+            self.write_system_log(f'[백필] 직행 URL 백필 시작 — 대상 {len(names)}명')
+            driver = SeleniumManager.create_incognito(background=True)
+            SeleniumManager.lms_login(driver, lms_id, lms_pw)
+            wait = WebDriverWait(driver, 10)
+
+            for idx, name in enumerate(names, 1):
+                tag = f'[백필 {idx}/{len(names)}]'
+                cached = self.lms_info_cache.get(name)
+                # race: 다른 곳에서 이미 채워졌으면 스킵
+                if not isinstance(cached, dict):
+                    continue
+                if (cached.get('detail_url') or '').strip():
+                    continue
+
+                try:
+                    driver.get(
+                        'https://www.lmsone.com/wcms/member/memManage/memList.asp'
+                    )
+                    search_box = wait.until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR,
+                             "input[name='keyword'], input[name='keyWord']")
+                        )
+                    )
+                    driver.execute_script(
+                        "arguments[0].value = arguments[1];", search_box, name
+                    )
+                    search_box.send_keys(Keys.ENTER)
+                    time.sleep(0.4)
+
+                    # 결과 링크에서 href 만 추출 (클릭 X — 새창 안 띄움)
+                    name_norm = _normalize_person_name(name)
+                    href = ''
+                    for link in driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "table tbody tr a[href*='memWrite.asp']",
+                    ):
+                        link_norm = _normalize_person_name(link.text)
+                        if (link_norm == name_norm
+                                or link_norm.startswith(name_norm + '(')):
+                            href = link.get_attribute('href') or ''
+                            break
+
+                    if not href:
+                        self.write_system_log(f'{tag} {name} — 검색 결과 없음')
+                        not_found += 1
+                        continue
+
+                    mid = re.search(r'member_id=([^&]+)', href)
+                    mseq = re.search(r'member_seq=([^&]+)', href)
+                    if not (mid and mseq):
+                        self.write_system_log(f'{tag} {name} — URL 파싱 실패')
+                        errors += 1
+                        continue
+
+                    cached['detail_url'] = (
+                        'https://www.lmsone.com/wcms/member/memManage/memWrite.asp'
+                        f'?mode=U&member_id={mid.group(1)}&member_seq={mseq.group(1)}'
+                    )
+                    self.lms_info_cache[name] = cached
+                    self._save_lms_cache()
+                    success += 1
+                    self.write_system_log(f'{tag} {name} ✓')
+
+                except Exception as e:
+                    self.write_system_log(f'{tag} {name} 실패: {e}')
+                    errors += 1
+
+            self.write_system_log(
+                f'[백필] 완료 — 성공 {success} / 결과없음 {not_found} / 오류 {errors}'
+            )
+            self.after(
+                0, lambda: self._popup_to_front(
+                    '직행 URL 백필 완료',
+                    f'성공: {success}명\n검색 결과 없음: {not_found}명\n오류: {errors}명'
+                )
+            )
+        except Exception as e:
+            self.write_system_log(f'[백필] 치명적 오류: {e}')
+            self.after(
+                0, lambda: messagebox.showerror('백필 오류', str(e))
+            )
+        finally:
+            SeleniumManager.safe_quit(driver)
+            self._backfill_running = False
+
     def _prefetch_students_info(self, names: list):
         """일괄 등록 후 학생 정보를 미리 크롤링해 캐시에 저장."""
         lms_id, lms_pw = self.cfg.get_credentials()
@@ -5581,7 +6107,7 @@ class AraonWorkstation(ctk.CTk):
                         )
                     )
                     driver.execute_script(
-                        f"arguments[0].value = '{name}';", search_box
+                        "arguments[0].value = arguments[1];", search_box, name
                     )
                     search_box.send_keys(Keys.ENTER)
                     time.sleep(0.5)
@@ -5733,6 +6259,7 @@ class AraonWorkstation(ctk.CTk):
             ('📋 퀵카피 텍스트 편집', self.popup_copy_edit),
             ('🔑 LMS 계정 설정', self.popup_accounts),
             ('🎓 수업방 URL 설정', self.popup_class_room),
+            ('🔗 캐시 직행 URL 백필', self.start_detail_url_backfill),
         ]:
             self._make_button(pop, text=label, variant='ghost', height=45, command=cmd
                               ).pack(fill='x', padx=30, pady=8)

@@ -18,6 +18,22 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 
+def _silence_chrome(opts: Options) -> None:
+    """Chrome/ChromeDriver 콘솔 노이즈(DevTools listening, GCM, TFLite 등) 차단."""
+    opts.add_argument('--log-level=3')                                # FATAL 만 출력
+    opts.add_argument('--disable-logging')
+    opts.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+
+def _silent_service(path: str) -> Service:
+    """ChromeDriver stderr 를 /dev/null 로 버리는 Service."""
+    try:
+        return Service(path, log_output=os.devnull)
+    except TypeError:
+        # 구버전 selenium fallback (log_output 미지원)
+        return Service(path)
+
+
 class SeleniumManager:
     """
     드라이버 생성 설정을 중앙화.
@@ -45,6 +61,7 @@ class SeleniumManager:
         opts = Options()
         opts.add_argument('--incognito')
         opts.add_argument('--disable-popup-blocking')
+        _silence_chrome(opts)
         if background:
             # 화면 밖으로 배치 + 이후 minimize — 포커스 스틸 최소화
             opts.add_argument('--window-position=-32000,-32000')
@@ -54,7 +71,7 @@ class SeleniumManager:
             "profile.default_content_setting_values.popups": 1,
         }
         opts.add_experimental_option("prefs", prefs)
-        drv = webdriver.Chrome(service=Service(path), options=opts)
+        drv = webdriver.Chrome(service=_silent_service(path), options=opts)
         if background:
             try:
                 drv.minimize_window()
@@ -73,13 +90,14 @@ class SeleniumManager:
         opts = Options()
         opts.add_argument(f'--user-data-dir={profile_dir}')
         opts.add_argument('--disable-popup-blocking')
+        _silence_chrome(opts)
         opts.page_load_strategy = page_load_strategy
         prefs = {
             "profile.managed_default_content_settings.images": 2,
             "profile.default_content_setting_values.popups": 1,
         }
         opts.add_experimental_option("prefs", prefs)
-        return webdriver.Chrome(service=Service(path), options=opts)
+        return webdriver.Chrome(service=_silent_service(path), options=opts)
 
     @staticmethod
     def safe_quit(driver):
@@ -102,9 +120,13 @@ class SeleniumManager:
         wait = WebDriverWait(driver, wait_timeout)
         driver.get('https://www.lmsone.com/wcms/')
         driver.execute_script(
-            f"document.getElementById('user_id').value = '{lms_id}';"
-            f"document.getElementById('user_pw').value = '{lms_pw}';"
-            "document.querySelector('.loginBtn a').click();"
+            """
+            document.getElementById('user_id').value = arguments[0];
+            document.getElementById('user_pw').value = arguments[1];
+            document.querySelector('.loginBtn a').click();
+            """,
+            lms_id,
+            lms_pw,
         )
         wait.until(EC.url_contains('wcms'))
         return wait

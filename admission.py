@@ -554,7 +554,7 @@ class AdmissionApp(ctk.CTk):
                     (By.CSS_SELECTOR, "input[name='keyword'], input[name='keyWord']")
                 )
             )
-            driver.execute_script(f"arguments[0].value = '{name}';", search_box)
+            driver.execute_script("arguments[0].value = arguments[1];", search_box, name)
             search_box.send_keys(Keys.ENTER)
             time.sleep(0.5)
 
