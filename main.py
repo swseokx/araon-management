@@ -30,7 +30,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchWindowException,
+    TimeoutException,
+    WebDriverException,
+)
 
 # 공통 코어
 from araon_core import ConfigManager, LogManager, SheetManager, SeleniumManager
@@ -75,6 +80,26 @@ def _is_running_from_temp(base_path: str) -> bool:
 def _normalize_person_name(name: str) -> str:
     """이름 비교용 정규화: 모든 공백 제거 + 소문자."""
     return re.sub(r'\s+', '', (name or '').strip()).lower()
+
+
+def _is_dead_webdriver_session(exc: Exception) -> bool:
+    """Chrome/ChromeDriver 세션이 이미 종료된 오류인지 판별한다."""
+    if isinstance(exc, (InvalidSessionIdException, NoSuchWindowException)):
+        return True
+    if not isinstance(exc, WebDriverException):
+        return False
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            'invalid session id',
+            'chrome not reachable',
+            'disconnected',
+            'no such window',
+            'target window already closed',
+            'web view not found',
+        )
+    )
 
 
 def _get_all_chrome_hwnds() -> set:
@@ -5788,24 +5813,28 @@ class AraonWorkstation(ctk.CTk):
         """
         lms_id, lms_pw = self.cfg.get_credentials()
         driver = None
-        try:
-            self.write_system_log('일괄 강의방 등록 매크로 시작...')
+        wait = None
+        short_wait = None
+        main_window = None
+
+        def _open_enroll_popup(clear_existing: bool):
+            """수업방으로 이동해 학생 검색 팝업까지 연다. clear_existing은 최초 1회만 True."""
+            nonlocal driver, wait, short_wait, main_window
+
+            SeleniumManager.safe_quit(driver)
             driver = SeleniumManager.create_incognito(background=True)
             wait = SeleniumManager.lms_login(driver, lms_id, lms_pw)
             short_wait = WebDriverWait(driver, 3)
 
-            # ── URL 직접 이동 ──
             self.write_system_log(f'수업방으로 이동: {room_url[:80]}...')
             driver.get(room_url)
             time.sleep(2.0)
 
-            # 페이지가 완전히 로드될 때까지 검색 버튼 등장 대기
+            search_xpath = (
+                "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]"
+            )
             try:
-                wait.until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
-                    )
-                )
+                wait.until(EC.presence_of_element_located((By.XPATH, search_xpath)))
             except Exception as e:
                 self.write_system_log(f'수업방 페이지 로드 실패: {e}')
                 self.after(0, lambda: messagebox.showerror(
@@ -5813,35 +5842,32 @@ class AraonWorkstation(ctk.CTk):
                     '수업방 페이지를 불러오지 못했습니다.\n'
                     '환경설정 → 🎓 수업방 URL 설정 에서 올바른 URL 인지 확인해주세요.'
                 ))
-                return
+                raise
 
-            # ── 기존 학생 전체 삭제 ──
-            try:
-                self.write_system_log('기존 학생 전체 삭제 중...')
-                driver.execute_script(
-                    "var chk = document.getElementById('allSelect');"
-                    "if(chk && !chk.checked) { chk.click(); }"
-                )
-                time.sleep(0.5)
-                driver.execute_script(
-                    "if(typeof delStudent === 'function') { delStudent(); } "
-                    "else { var btn = document.querySelector('.button10g[value=\"학생삭제\"]'); "
-                    "if(btn) btn.click(); }"
-                )
-                time.sleep(0.5)
-                short_wait.until(EC.alert_is_present()).accept()
-                time.sleep(0.5)
-                short_wait.until(EC.alert_is_present()).accept()
-                time.sleep(1.0)
-                self.write_system_log('기존 학생 삭제 완료')
-            except Exception as e:
-                self.write_system_log(f'삭제 시도 (비어있음 또는 실패): {e}')
+            if clear_existing:
+                try:
+                    self.write_system_log('기존 학생 전체 삭제 중...')
+                    driver.execute_script(
+                        "var chk = document.getElementById('allSelect');"
+                        "if(chk && !chk.checked) { chk.click(); }"
+                    )
+                    time.sleep(0.5)
+                    driver.execute_script(
+                        "if(typeof delStudent === 'function') { delStudent(); } "
+                        "else { var btn = document.querySelector('.button10g[value=\"학생삭제\"]'); "
+                        "if(btn) btn.click(); }"
+                    )
+                    time.sleep(0.5)
+                    short_wait.until(EC.alert_is_present()).accept()
+                    time.sleep(0.5)
+                    short_wait.until(EC.alert_is_present()).accept()
+                    time.sleep(1.0)
+                    self.write_system_log('기존 학생 삭제 완료')
+                except Exception as e:
+                    self.write_system_log(f'삭제 시도 (비어있음 또는 실패): {e}')
 
-            # ── 학생 검색 팝업 열기 ──
             search_btn = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//input[@value='검색' and contains(@onclick, 'studentSearch.asp')]")
-                )
+                EC.presence_of_element_located((By.XPATH, search_xpath))
             )
             main_window = driver.current_window_handle
             driver.execute_script('arguments[0].click();', search_btn)
@@ -5852,8 +5878,70 @@ class AraonWorkstation(ctk.CTk):
                     driver.switch_to.window(wh)
                     break
 
+        def _register_one_student(student_name: str) -> bool:
+            """현재 열린 학생 검색 팝업에서 학생 1명을 등록한다."""
+            self.write_system_log(f'[{student_name}] 등록 중...')
+            kw = wait.until(EC.presence_of_element_located((By.NAME, 'keyWord')))
+            kw.clear()
+            kw.send_keys(student_name)
+
+            srch = driver.find_element(
+                By.XPATH,
+                "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
+            )
+            driver.execute_script('arguments[0].click();', srch)
+            time.sleep(1.2)
+
+            checkboxes = driver.find_elements(By.NAME, 'member_seq')
+            if not checkboxes:
+                self.write_system_log(f'[{student_name}] 검색 결과 없음')
+                return False
+
+            name_norm = ' '.join(student_name.strip().split()).lower()
+            exact_cb = paren_cb = None
+            for cb in checkboxes:
+                try:
+                    for td in cb.find_elements(By.XPATH, './ancestor::tr/td'):
+                        td_norm = ' '.join(td.text.strip().split()).lower()
+                        if td_norm == name_norm:
+                            exact_cb = cb
+                            break
+                        elif td_norm.startswith(name_norm + '(') and not paren_cb:
+                            paren_cb = cb
+                    if exact_cb:
+                        break
+                except Exception:
+                    pass
+
+            target_cb = exact_cb or paren_cb or checkboxes[0]
+            driver.execute_script('arguments[0].click();', target_cb)
+            time.sleep(0.3)
+
+            try:
+                submit_btn = driver.find_element(
+                    By.XPATH,
+                    "//input[@type='button' and @name='등록' and @value='등록']"
+                )
+                driver.execute_script('arguments[0].click();', submit_btn)
+            except Exception:
+                driver.execute_script('Submit();')
+
+            for _ in range(2):
+                try:
+                    short_wait.until(EC.alert_is_present()).accept()
+                    time.sleep(0.8)
+                except Exception:
+                    break
+
+            return True
+
+        try:
+            self.write_system_log('일괄 강의방 등록 매크로 시작...')
+            _open_enroll_popup(clear_existing=True)
+
             # ── 학생별 등록 ──
             success_count = 0
+            failure_count = 0
             for row in self.current_data_cache:
                 if len(row) < 2:
                     continue
@@ -5861,72 +5949,38 @@ class AraonWorkstation(ctk.CTk):
                 if not student_name or student_name == '-' or '학생명' in student_name:
                     continue
 
-                try:
-                    self.write_system_log(f'[{student_name}] 등록 중...')
-                    kw = wait.until(EC.presence_of_element_located((By.NAME, 'keyWord')))
-                    kw.clear()
-                    kw.send_keys(student_name)
-
-                    srch = driver.find_element(
-                        By.XPATH,
-                        "//input[@type='button' and @value='검색' and contains(@class, 'srch')]"
-                    )
-                    driver.execute_script('arguments[0].click();', srch)
-                    time.sleep(1.2)
-
-                    checkboxes = driver.find_elements(By.NAME, 'member_seq')
-                    if not checkboxes:
-                        self.write_system_log(f'[{student_name}] 검색 결과 없음')
-                        continue
-
-                    name_norm = ' '.join(student_name.strip().split()).lower()
-                    exact_cb = paren_cb = None
-                    for cb in checkboxes:
-                        try:
-                            for td in cb.find_elements(By.XPATH, './ancestor::tr/td'):
-                                td_norm = ' '.join(td.text.strip().split()).lower()
-                                if td_norm == name_norm:
-                                    exact_cb = cb
-                                    break
-                                elif td_norm.startswith(name_norm + '(') and not paren_cb:
-                                    paren_cb = cb
-                            if exact_cb:
-                                break
-                        except Exception:
-                            pass
-
-                    target_cb = exact_cb or paren_cb or checkboxes[0]
-                    driver.execute_script('arguments[0].click();', target_cb)
-                    time.sleep(0.3)
-
+                for attempt in range(2):
                     try:
-                        submit_btn = driver.find_element(
-                            By.XPATH,
-                            "//input[@type='button' and @name='등록' and @value='등록']"
-                        )
-                        driver.execute_script('arguments[0].click();', submit_btn)
-                    except Exception:
-                        driver.execute_script('Submit();')
+                        if _register_one_student(student_name):
+                            success_count += 1
+                            self.write_system_log(f'[{student_name}] 등록 성공!')
+                        break
+                    except Exception as e:
+                        if _is_dead_webdriver_session(e) and attempt == 0:
+                            self.write_system_log(
+                                f'[{student_name}] Chrome 세션 종료 감지 — '
+                                '수업방 재접속 후 현재 학생 재시도'
+                            )
+                            _open_enroll_popup(clear_existing=False)
+                            continue
+                        failure_count += 1
+                        self.write_system_log(f'[{student_name}] 에러: {e}')
+                        break
 
-                    for _ in range(2):
-                        try:
-                            short_wait.until(EC.alert_is_present()).accept()
-                            time.sleep(0.8)
-                        except Exception:
-                            break
-
-                    success_count += 1
-                    self.write_system_log(f'[{student_name}] 등록 성공!')
-
-                except Exception as e:
-                    self.write_system_log(f'[{student_name}] 에러: {e}')
-
-            driver.close()
-            driver.switch_to.window(main_window)
-            self.write_system_log(f'입학식 일괄 등록 완료! (성공: {success_count}명)')
+            try:
+                driver.close()
+                driver.switch_to.window(main_window)
+            except Exception:
+                pass
+            self.write_system_log(
+                f'입학식 일괄 등록 완료! '
+                f'(성공: {success_count}명 / 실패: {failure_count}명)'
+            )
             self.after(
                 0, lambda: self._popup_to_front(
-                    '완료', f'입학식 일괄 등록 완료\n(성공: {success_count}건)'
+                    '완료',
+                    f'입학식 일괄 등록 완료\n'
+                    f'(성공: {success_count}건 / 실패: {failure_count}건)'
                 )
             )
 
